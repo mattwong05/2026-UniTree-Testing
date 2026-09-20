@@ -25,7 +25,7 @@ sudo ifconfig en10 inet 192.168.123.100 -alias
 
 ## 运行方式
 
-脚本使用机器人已有 Python 3.8、Unitree SDK、Cyclone DDS、NumPy、TensorRT 8.5 和 CUDA 11.4。不在机器人安装依赖、不升级固件、不改变功率模式。脚本经 SSH 标准输入运行，输出写在 Mac。
+脚本使用机器人已有 Python 3.8、Unitree SDK、Cyclone DDS、NumPy、TensorRT 8.5 和 CUDA 11.4。不在机器人安装依赖、不升级固件、不改变功率模式。脚本可经 SSH 标准输入运行，也可复制到机上临时目录执行。
 
 只读关节记录，包含全采样统计和约 1 Hz 快照：
 
@@ -46,11 +46,13 @@ CPU 检查是 8 个进程各校验 8 MiB 缓冲区；GPU/DLA 是固定小型 FP1
 手臂脚本默认只做预检，不创建命令发布器：
 
 ```sh
-ssh unitree@192.168.123.164 'timeout 12 python3 -' \
-  < scripts/right_elbow_check.py > elbow-preflight.jsonl
+ssh unitree@192.168.123.164 'timeout 12 python3 - --check-all' \
+  < scripts/upper_body_check.py > arm-preflight.jsonl
 ```
 
-`--execute` 是主动控制入口，当前有未解决的实机接管现象，不能当作已通过验证的控制程序使用。主动操作必须先核对现场吊装、清空动作区域、受训操作员及遥控停止，并处理报告中的接管问题。脚本只发布 `rt/arm_sdk`，保持腰与双臂的实测姿态，目标是右肘 +5° 后回位；不发布全身 `rt/lowcmd`，不切换运动模式。
+原 `right_elbow_check.py` 已扩展并更名为 `upper_body_check.py`，可选择左右肩、肘、腕共 14 轴。默认相对偏移 +2°，允许正负 0.1–5°；`--check-all` 仅预检，不能与 `--execute` 合用。完整的 SSH 命令、关节名称和控制原理见 [SSH 上肢控制说明](docs/ssh-upper-body.md)。2026-09-20 的追加实机检查中，14 轴只读预检全部通过；未追加动作测试。
+
+`--execute` 是主动控制入口，当前有未解决的实机接管现象，不能当作已通过验证的控制程序使用。脚本只发布 `rt/arm_sdk`，在接管期间跟随上身实测姿态，再保持接管结束时的姿态，使所选关节做一次小角度往返；不发布全身 `rt/lowcmd`，不切换运动模式。目标角度可按单关节指定，但接管权重作用于上身，其他关节仍参与保持，不能理解成只给一个电机上电。
 
 该脚本绑定本机已观测的 `FSM 802 / mode_machine 5 / mode_pr 0` 与现有 `127.0.0.1:8080/status` 姿态服务。它不是通用 G1 控制器。原有姿态服务必须持续为 IDLE。低状态 CRC 错误、数据超过 100 ms、遥控按键、错误码、关节模式变化、温度达到 60°C、过大偏差/速度/估算力矩或下肢明显移动都会中止。阈值是本次短测的保守限制，不是厂家额定值。
 
