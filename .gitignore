@@ -2,4 +2,5 @@
 __pycache__/
 *.pyc
 evidence/
+output/pdf/
 Unitree_G1_EDU_U2_二手采购完整验收表.xlsx

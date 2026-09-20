@@ -4,6 +4,8 @@
 
 当前已经验证网络连接、Jetson 计算功能和 29 轴遥测。主动手臂测试两次在接管阶段触发保护，未完成目标轨迹。**目前不能将主动控制或整机电机能力判定为验收通过。**
 
+计算单元专项报告见 [100 TOPS 规格核验与 INT8 短测](reports/compute-capacity-2026-09-20.md)，现场 PDF 保存在 `output/pdf/G1_U2_计算单元能力报告_2026-09-20.pdf`。设备配置与原始 Orin NX 16 GB 标称 100 TOPS 相符；本次 GPU、双 DLA 的 INT8 短测及 GPU 稀疏测试通过有限自检，**未验证持续 100 TOPS**。
+
 ## 环境和连接
 
 现场 Mac 为 Apple Silicon/macOS，USB 网卡为 AX88179B/en10。机器人计算模块为 `192.168.123.164`，用户 `unitree`。密码不放入脚本、文档或 Git。
@@ -42,6 +44,20 @@ ssh unitree@192.168.123.164 'timeout 140 python3 - --seconds 10' \
 ```
 
 CPU 检查是 8 个进程各校验 8 MiB 缓冲区；GPU/DLA 是固定小型 FP16 卷积与 NumPy 结果比较。它们不构成全内存检测、100 TOPS 测量或持续热稳定验收。计算脚本在读不到温度或温度达到保守的 75°C 测试阈值时退出。
+
+INT8 吞吐短测使用已有 TensorRT，依次运行 GPU、DLA0、DLA1，每项约 10 秒（引擎构建另计）：
+
+```sh
+ssh unitree@192.168.123.164 'timeout --kill-after=5 690 python3 - --seconds 10' \
+  < scripts/compute_int8_bench.py > int8-dense.jsonl 2> int8-dense.stderr
+
+ssh unitree@192.168.123.164 'timeout --kill-after=5 230 python3 - --target gpu --sparse --seconds 10' \
+  < scripts/compute_int8_bench.py > int8-sparse.jsonl 2> int8-sparse.stderr
+```
+
+保持机器人静止且散热正常，避免并发运动测试。`--target gpu|dla0|dla1` 可单独选目标，`--seconds` 限 1–30；`--sparse` 仅支持 GPU。程序每 0.5 秒检查可读温度，无有效读数或最高读数达到 75°C 时退出，个别不可读传感器会跳过；另有构建/运行时限和外部 timeout。Python 监控线程不是独立硬件保护。
+
+JSONL 保存完整引擎信息、逐窗口计时和汇总，stderr 保存 TensorRT 提示。指标是 8 层固定 1×1 卷积的 dense-equivalent TOPS，一次乘加算 2 次运算，不额外对稀疏结果乘二。主指标排除构建、预热、传输及窗口间日志开销。正确性只覆盖常量输入特例；DLA 禁止 GPU fallback，但边界重排可用 GPU。各目标依次运行，不能将结果相加充当并发性能，也不能据此签署 100 TOPS 达标。详情、实际结果及官方来源见专项报告。
 
 手臂脚本默认只做预检，不创建命令发布器：
 
