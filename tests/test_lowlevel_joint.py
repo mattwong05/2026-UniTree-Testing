@@ -111,14 +111,43 @@ class LowlevelPlanTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             ll.validate_motion(msg, anchors, 18, msg.motor_state[18].q, 4., math.radians(15))
 
+    def test_shoulder_hold_targets_and_torque_guards(self):
+        holds = {15: .12, 16: .13, 17: .14}
+        msg = command()
+        ll.set_command(msg, 'left_elbow', 1., True, holds)
+        self.assertEqual([i for i, m in enumerate(msg.motor_cmd) if m.mode], [15, 16, 17, 18])
+        for i, q in holds.items():
+            self.assertEqual((msg.motor_cmd[i].q, msg.motor_cmd[i].kp, msg.motor_cmd[i].kd), (q, 40., 1.))
+        ll.set_command(msg, 'left_elbow', 1., False, holds)
+        self.assertTrue(all((m.mode, m.kp, m.kd, m.tau) == (0, 0, 0, 0) for m in msg.motor_cmd))
+        for bad in ({15: .1}, {15: math.nan, 16: .1, 17: .1}, {15: .1, 16: .1, 17: 3.}):
+            with self.assertRaises(ValueError):
+                ll.validate_holds(bad)
+        with self.assertRaises(ValueError):
+            ll.set_command(msg, 'right_elbow', 1., True, holds)
+        robot = state()
+        for i, q in holds.items():
+            robot.motor_state[i].q = q
+            robot.motor_state[i].mode = 1
+        ll.validate_state(robot, 18, held_indices=holds)
+        with self.assertRaises(RuntimeError):
+            ll.validate_state(robot, 18)
+        anchors = [m.q for m in robot.motor_state[:29]]
+        robot.motor_state[16].tau_est = 4.01
+        with self.assertRaises(RuntimeError):
+            ll.validate_motion(robot, anchors, 18, .1, 4., math.radians(15), holds)
+
 
 class FakeRobot:
-    def __init__(self, owner='', remote_stop=False, enable_works=True, disable_works=True, passive_motion=False):
+    def __init__(self, owner='', remote_stop=False, enable_works=True, disable_works=True, passive_motion=False,
+                 missing_axis=None, shoulder_torque_fault=False):
         self.owner = owner
         self.remote_stop = remote_stop
         self.enable_works = enable_works
         self.disable_works = disable_works
         self.passive_motion = passive_motion
+        self.missing_axis = missing_axis
+        self.shoulder_torque_fault = shoulder_torque_fault
         self.now = 0.
         self.msg = state()
         self.callback = None
@@ -137,6 +166,10 @@ class FakeRobot:
                 self.msg.wireless_remote[2] = 1
             if self.passive_motion and self.now-self.control_started > 4:
                 self.msg.motor_state[15].q = .151
+            if self.missing_axis is not None:
+                self.msg.motor_state[self.missing_axis].mode = 0
+            if self.shoulder_torque_fault and self.now-self.control_started > .8:
+                self.msg.motor_state[16].tau_est = 4.01
         if self.callback:
             self.callback(deepcopy(self.msg))
     def subscriber(self, topic, _type):
@@ -250,6 +283,33 @@ class LowlevelRuntimeTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertFalse(rows[-1]['all_29_modes_zero'])
         self.assertFalse(any(r['kind']=='result' for r in rows))
+    def test_shoulder_hold_preflight_is_readonly(self):
+        robot = FakeRobot()
+        code, rows = robot.run(['--hold-left-shoulder'])
+        self.assertEqual(code, 0)
+        self.assertEqual(robot.publishers, 0)
+        self.assertEqual(rows[0]['enabled_axes'], 4)
+    def test_shoulder_hold_is_fixed_through_elbow_excursion(self):
+        robot = FakeRobot()
+        with patch.object(ll, 'PERIOD', .01):
+            code, rows = robot.run(['--delta-deg', '15', '--hold-left-shoulder', '--execute'])
+        self.assertEqual(code, 0)
+        self.assertEqual(rows[-1]['enabled_axes'], 4)
+        self.assertTrue(rows[-1]['stop_feedback_verified'])
+        for cmd in robot.writes:
+            active = [i for i, m in enumerate(cmd.motor_cmd) if m.mode]
+            self.assertIn(active, ([], [15, 16, 17, 18]))
+            if active:
+                self.assertTrue(all(cmd.motor_cmd[i].q == .1 for i in (15, 16, 17)))
+        self.assertTrue(all(all(m.mode == 0 for m in cmd.motor_cmd) for cmd in robot.writes[-20:]))
+    def test_shoulder_faults_and_remote_stop_disable_all_four_axes(self):
+        for kwargs in ({'missing_axis':16}, {'shoulder_torque_fault':True}, {'remote_stop':True}):
+            robot = FakeRobot(**kwargs)
+            code, rows = robot.run(['--hold-left-shoulder', '--hold-only', '--execute'])
+            self.assertEqual(code, 1)
+            self.assertTrue(any(r['kind']=='abort' for r in rows))
+            self.assertTrue(rows[-1]['all_29_modes_zero'])
+            self.assertTrue(all(all(m.mode == 0 for m in cmd.motor_cmd) for cmd in robot.writes[-20:]))
 
 
 if __name__ == '__main__':

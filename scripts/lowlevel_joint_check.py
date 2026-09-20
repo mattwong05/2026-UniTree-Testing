@@ -1,8 +1,9 @@
-"""Suspended G1: enable ONE joint on rt/lowcmd, then disable all commands.
+"""Suspended G1: move one joint on rt/lowcmd, then disable all commands.
 
 Read-only unless --execute is supplied. Requires released motion ownership,
 all 29 joints initially disabled, a trained observer and a verified stop for
 this low-level mode. Never calls ReleaseMode, changes PR/AB mode, or walks.
+The optional --hold-left-shoulder enables three extra joints at fixed angles.
 """
 import argparse
 import fcntl
@@ -23,6 +24,7 @@ JOINTS = {
     "left_knee": (3, -0.087267, 2.8798, 100., 2., 6.),
     "right_knee": (9, -0.087267, 2.8798, 100., 2., 6.),
 }
+LEFT_SHOULDER_LIMITS = {15: (-3.0892, 2.6704), 16: (-1.5882, 2.2515), 17: (-2.618, 2.618)}
 PERIOD = .002
 HOLD_DURATION = 3.
 
@@ -77,7 +79,19 @@ def validate_plan(name, q, delta, hold_only=False):
         raise ValueError("start/target exceeds reference bounds with 5-degree margin")
 
 
-def set_command(command, name, q, enabled):
+def validate_holds(holds):
+    if not holds:
+        return
+    if set(holds) != set(LEFT_SHOULDER_LIMITS):
+        raise ValueError('shoulder hold must contain exactly axes 15, 16, 17')
+    margin = math.radians(5)
+    for index, q in holds.items():
+        lower, upper = LEFT_SHOULDER_LIMITS[index]
+        if not math.isfinite(q) or not lower+margin <= q <= upper-margin:
+            raise ValueError('shoulder hold target outside reference bounds')
+
+
+def set_command(command, name, q, enabled, holds=None):
     """Explicitly disable every slot before optionally enabling the selected one."""
     for motor in command.motor_cmd:
         motor.mode = 0
@@ -88,15 +102,22 @@ def set_command(command, name, q, enabled):
         index, _, _, kp, kd, _ = JOINTS[name]
         motor = command.motor_cmd[index]
         motor.mode, motor.q, motor.kp, motor.kd = 1, q, kp, kd
+        if holds:
+            if name != 'left_elbow':
+                raise ValueError('shoulder hold is only supported with left_elbow')
+            validate_holds(holds)
+            for held, target in holds.items():
+                motor = command.motor_cmd[held]
+                motor.mode, motor.q, motor.kp, motor.kd = 1, target, 40., 1.
 
 
-def validate_state(msg, selected=None, ignore_remote=False):
+def validate_state(msg, selected=None, ignore_remote=False, held_indices=()):
     if msg.mode_machine != 5 or msg.mode_pr != 0 or len(msg.motor_state) < 29:
         raise RuntimeError("unexpected robot/PR mode or missing axes")
     if not ignore_remote and (len(msg.wireless_remote) < 4 or any(msg.wireless_remote[2:4])):
         raise RuntimeError("remote button pressed or remote data unavailable")
     for index, motor in enumerate(msg.motor_state[:29]):
-        allowed = (0, 1) if index == selected else (0,)
+        allowed = (0, 1) if index == selected or index in held_indices else (0,)
         if motor.mode not in allowed:
             raise RuntimeError("joint %d unexpectedly enabled or changed mode" % index)
         if motor.motorstate != 0:
@@ -107,7 +128,7 @@ def validate_state(msg, selected=None, ignore_remote=False):
             raise RuntimeError("joint %d temperature/voltage test limit" % index)
 
 
-def validate_motion(msg, anchor, selected, desired, torque_limit, delta=0.):
+def validate_motion(msg, anchor, selected, desired, torque_limit, delta=0., holds=None):
     for index, motor in enumerate(msg.motor_state[:29]):
         travel_limit = max(.08, abs(delta)+.05) if index == selected else .05
         if abs(motor.q-anchor[index]) > travel_limit or abs(motor.dq) > .3:
@@ -115,6 +136,10 @@ def validate_motion(msg, anchor, selected, desired, torque_limit, delta=0.):
     motor = msg.motor_state[selected]
     if abs(motor.q-desired) > .05 or abs(motor.tau_est) > torque_limit:
         raise RuntimeError("selected joint tracking/estimated-torque stop")
+    for held, target in (holds or {}).items():
+        motor = msg.motor_state[held]
+        if abs(motor.q-target) > .05 or abs(motor.tau_est) > 4.:
+            raise RuntimeError('held shoulder joint %d tracking/estimated-torque stop' % held)
 
 
 def response_metrics(samples, delta, hold_only):
@@ -141,8 +166,13 @@ def main():
     parser.add_argument("--joint", choices=JOINTS, default="left_elbow")
     parser.add_argument("--delta-deg", type=float, default=1.)
     parser.add_argument("--hold-only", action="store_true")
+    parser.add_argument("--hold-left-shoulder", action="store_true",
+                        help="enable left shoulder axes 15/16/17 at fixed initial angles; left_elbow only")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
+    if args.hold_left_shoulder and args.joint != 'left_elbow':
+        parser.error('--hold-left-shoulder requires --joint left_elbow')
+    held_indices = tuple(LEFT_SHOULDER_LIMITS) if args.hold_left_shoulder else ()
     delta = math.radians(args.delta_deg)
     try:
         validate_delta(args.joint, delta)
@@ -178,7 +208,8 @@ def main():
                 raise RuntimeError('existing pose server is not IDLE')
     pose_idle()
     crc = CRC()
-    lock = threading.Lock()
+    # Signal handlers may latch a stop while this same thread holds the lock.
+    lock = threading.RLock()
     state = dict(msg=None, received=0., fault=None)
     active = False
     def latch(reason):
@@ -190,7 +221,7 @@ def main():
                 raise RuntimeError('LowState CRC mismatch')
             with lock:
                 state['msg'], state['received'] = msg, time.monotonic()
-            validate_state(msg, index if active else None)
+            validate_state(msg, index if active else None, held_indices=held_indices if active else ())
         except Exception as exc:
             latch(exc)
     def other_command(_):
@@ -234,15 +265,18 @@ def main():
         while time.monotonic() < deadline:
             msg = current()
             if any(abs(m.q-anchor[i]) > .01 or abs(m.dq) > .15 for i, m in enumerate(msg.motor_state[:29])):
-                raise RuntimeError('all joints must be still before enabling one joint')
+                raise RuntimeError('all joints must be still before enabling test joints')
             time.sleep(.01)
         anchor = [m.q for m in current().motor_state[:29]]
         validate_plan(args.joint, anchor[index], delta, args.hold_only)
+        holds = {i: anchor[i] for i in held_indices}
+        validate_holds(holds)
         emit('preflight', execute=args.execute, joint=args.joint, index=index,
              hold_only=args.hold_only, anchor_rad=anchor[index], delta_deg=0 if args.hold_only else args.delta_deg,
              duration_s=duration, target_rad=anchor[index]+(0 if args.hold_only else delta),
              peak_target_speed_deg_s=0 if args.hold_only else 1.5*abs(args.delta_deg)/ramp_duration(delta),
-             enabled_axes=1, other_axes='mode 0; no holding torque', motion_owner=mode)
+             enabled_axes=1+len(holds), held_targets_rad=holds, initial_angles_rad=anchor,
+             other_axes='mode 0; no holding torque', motion_owner=mode)
         if not args.execute:
             return
         pose_idle()
@@ -262,20 +296,25 @@ def main():
                 raise RuntimeError('control loop delayed more than 50 ms')
             previous = now
             msg = current()
-            validate_state(msg, index)
+            validate_state(msg, index, held_indices=held_indices)
             offset, phase = target_offset(elapsed, delta, args.hold_only)
             desired = anchor[index]+offset
-            validate_motion(msg, anchor, index, desired, torque_limit, 0 if args.hold_only else delta)
-            if elapsed > .5 and msg.motor_state[index].mode != 1:
-                raise RuntimeError('selected joint enable not confirmed within 500 ms')
-            set_command(command, args.joint, desired, True)
+            validate_motion(msg, anchor, index, desired, torque_limit, 0 if args.hold_only else delta, holds)
+            if elapsed > .5:
+                for required in (index, *held_indices):
+                    if msg.motor_state[required].mode != 1:
+                        raise RuntimeError('joint %d enable not confirmed within 500 ms' % required)
+            set_command(command, args.joint, desired, True, holds)
             write()
             motor = msg.motor_state[index]
             samples.append((elapsed, motor.q))
             if elapsed >= next_log:
                 emit('control', elapsed_s=elapsed, phase=phase, joint=args.joint,
                      desired=desired, q=motor.q, dq=motor.dq, tau_est=motor.tau_est,
-                     mode=motor.mode, temperature=list(motor.temperature))
+                     mode=motor.mode, temperature=list(motor.temperature),
+                     held_joints=[dict(index=i, desired=holds[i], q=msg.motor_state[i].q,
+                                       dq=msg.motor_state[i].dq, tau_est=msg.motor_state[i].tau_est,
+                                       mode=msg.motor_state[i].mode) for i in held_indices])
                 next_log = elapsed+.1
             if elapsed >= duration:
                 break
@@ -316,6 +355,7 @@ def main():
         raise SystemExit(1)
     if result:
         emit('result', joint=args.joint, **result, stop_feedback_verified=stop_verified,
+             enabled_axes=1+len(held_indices), held_axes=list(held_indices),
              physical_observation='required', rated_torque_acceptance=False)
         if result['verdict'] == 'RESPONSE_OUTSIDE_TEST_LIMITS':
             raise SystemExit(1)
