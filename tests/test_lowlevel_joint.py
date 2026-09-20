@@ -137,6 +137,30 @@ class LowlevelPlanTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             ll.validate_motion(robot, anchors, 18, .1, 4., math.radians(15), holds)
 
+    def test_motion_stop_identifies_each_limit_and_exact_sample(self):
+        for field, value, expected in (('q', .151, ['tracking']),
+                                       ('tau_est', 4.01, ['estimated_torque']),
+                                       ('dq', -.301, ['velocity'])):
+            msg = state()
+            anchors = [m.q for m in msg.motor_state[:29]]
+            setattr(msg.motor_state[18], field, value)
+            with self.assertRaises(ll.MotionStop) as caught:
+                ll.validate_motion(msg, anchors, 18, .1, 4., math.radians(60))
+            details = caught.exception.snapshot
+            self.assertEqual(details['index'], 18)
+            self.assertEqual(details['violations'], expected)
+            self.assertEqual(details['q_rad'], msg.motor_state[18].q)
+            self.assertEqual(details['tau_est_nm'], msg.motor_state[18].tau_est)
+            if field == 'q':
+                self.assertAlmostEqual(details['tracking_error_deg'], math.degrees(.051))
+                self.assertAlmostEqual(details['tracking_limit_deg'], math.degrees(.05))
+        msg.motor_state[18].dq = 0
+        msg.motor_state[18].q = .151
+        msg.motor_state[18].tau_est = 4.01
+        with self.assertRaises(ll.MotionStop) as caught:
+            ll.validate_motion(msg, anchors, 18, .1, 4., math.radians(60))
+        self.assertEqual(caught.exception.snapshot['violations'], ['tracking', 'estimated_torque'])
+
     def test_sixty_degree_reverse_path_speed_limits_and_metric_windows(self):
         delta = math.radians(-60)
         for name in ('left_elbow', 'right_elbow'):
@@ -172,7 +196,7 @@ class LowlevelPlanTests(unittest.TestCase):
 
 class FakeRobot:
     def __init__(self, owner='', remote_stop=False, enable_works=True, disable_works=True, passive_motion=False,
-                 missing_axis=None, shoulder_torque_fault=False):
+                 missing_axis=None, shoulder_torque_fault=False, motion_fault=None):
         self.owner = owner
         self.remote_stop = remote_stop
         self.enable_works = enable_works
@@ -180,6 +204,7 @@ class FakeRobot:
         self.passive_motion = passive_motion
         self.missing_axis = missing_axis
         self.shoulder_torque_fault = shoulder_torque_fault
+        self.motion_fault = motion_fault
         self.now = 0.
         self.msg = state()
         self.callback = None
@@ -207,6 +232,9 @@ class FakeRobot:
                 self.msg.motor_state[self.missing_axis].mode = 0
             if self.shoulder_torque_fault and self.now-self.control_started > .8:
                 self.msg.motor_state[16].tau_est = 4.01
+            if self.motion_fault and self.now-self.control_started > .8:
+                axis, field, value = self.motion_fault
+                setattr(self.msg.motor_state[axis], field, value)
         if self.callback:
             self.callback(deepcopy(self.msg))
     def subscriber(self, topic, _type):
@@ -315,7 +343,7 @@ class LowlevelRuntimeTests(unittest.TestCase):
         robot = FakeRobot(passive_motion=True)
         code, rows = robot.run(['--joint', 'left_elbow', '--delta-deg', '15', '--execute'])
         self.assertEqual(code, 1)
-        self.assertTrue(any(r['kind']=='abort' and 'joint 15 displacement/velocity stop' in r['reason'] for r in rows))
+        self.assertTrue(any(r['kind']=='abort' and 'joint 15 displacement stop' in r['reason'] for r in rows))
         self.assertTrue(rows[-1]['all_29_modes_zero'])
         self.assertFalse(any(r['kind']=='result' for r in rows))
         self.assertTrue(all(all(m.mode == 0 for m in cmd.motor_cmd) for cmd in robot.writes[-20:]))
@@ -352,6 +380,23 @@ class LowlevelRuntimeTests(unittest.TestCase):
             self.assertTrue(any(r['kind']=='abort' for r in rows))
             self.assertTrue(rows[-1]['all_29_modes_zero'])
             self.assertTrue(all(all(m.mode == 0 for m in cmd.motor_cmd) for cmd in robot.writes[-20:]))
+
+    def test_exact_guard_snapshot_is_emitted_after_disable_and_keeps_failure_exit(self):
+        for axis, field, value, violation in ((18, 'q', .151, 'tracking'),
+                                               (18, 'tau_est', 4.01, 'estimated_torque'),
+                                               (18, 'dq', -.301, 'velocity'),
+                                               (16, 'tau_est', 4.01, 'estimated_torque')):
+            robot = FakeRobot(motion_fault=(axis, field, value))
+            code, rows = robot.run(['--hold-shoulder', '--hold-only', '--execute'])
+            self.assertEqual(code, 1)
+            details = next(r for r in rows if r['kind'] == 'guard_snapshot')
+            self.assertEqual(details['index'], axis)
+            self.assertEqual(details['violations'], [violation])
+            self.assertIn('elapsed_s', details)
+            kinds = [r['kind'] for r in rows]
+            self.assertLess(kinds.index('disable_sent'), kinds.index('guard_snapshot'))
+            self.assertTrue(rows[-1]['all_29_modes_zero'])
+            self.assertTrue(all(all(m.mode == 0 for m in c.motor_cmd) for c in robot.writes[-20:]))
     def test_identity_required_and_mismatch_never_publishes(self):
         for args in (['--execute'], ['--release-motion']):
             robot = FakeRobot()

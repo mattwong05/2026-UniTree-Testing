@@ -154,18 +154,43 @@ def validate_state(msg, selected=None, ignore_remote=False, held_indices=()):
             raise RuntimeError("joint %d temperature/voltage test limit" % index)
 
 
+class MotionStop(RuntimeError):
+    """Keep the triggering sample; periodic control logs may miss it."""
+    def __init__(self, reason, **snapshot):
+        super().__init__(reason)
+        self.snapshot = snapshot
+
+
 def validate_motion(msg, anchor, selected, desired, torque_limit, delta=0., holds=None):
     for index, motor in enumerate(msg.motor_state[:29]):
         travel_limit = max(.08, abs(delta)+.05) if index == selected else .05
-        if abs(motor.q-anchor[index]) > travel_limit or abs(motor.dq) > .3:
-            raise RuntimeError("joint %d displacement/velocity stop: q=%g dq=%g" % (index, motor.q, motor.dq))
-    motor = msg.motor_state[selected]
-    if abs(motor.q-desired) > .05 or abs(motor.tau_est) > torque_limit:
-        raise RuntimeError("selected joint tracking/estimated-torque stop")
-    for held, target in (holds or {}).items():
-        motor = msg.motor_state[held]
-        if abs(motor.q-target) > .05 or abs(motor.tau_est) > 4.:
-            raise RuntimeError('held shoulder joint %d tracking/estimated-torque stop' % held)
+        violations = []
+        if abs(motor.q-anchor[index]) > travel_limit:
+            violations.append('displacement')
+        if abs(motor.dq) > .3:
+            violations.append('velocity')
+        if violations:
+            raise MotionStop('joint %d %s stop' % (index, '/'.join(violations)),
+                index=index, violations=violations, q_rad=motor.q,
+                travel_deg=math.degrees(motor.q-anchor[index]),
+                travel_limit_deg=math.degrees(travel_limit), dq_rad_s=motor.dq,
+                velocity_limit_rad_s=.3, tau_est_nm=motor.tau_est)
+    targets = [(selected, desired, torque_limit, 'selected joint')]
+    targets += [(held, target, 4., 'held shoulder joint') for held, target in (holds or {}).items()]
+    for index, target, limit, scope in targets:
+        motor = msg.motor_state[index]
+        error = motor.q-target
+        violations = []
+        if abs(error) > .05:
+            violations.append('tracking')
+        if abs(motor.tau_est) > limit:
+            violations.append('estimated_torque')
+        if violations:
+            raise MotionStop('%s %d %s stop' % (scope, index, '/'.join(violations)),
+                index=index, violations=violations, q_rad=motor.q, desired_rad=target,
+                tracking_error_deg=math.degrees(error), tracking_limit_deg=math.degrees(.05),
+                travel_deg=math.degrees(motor.q-anchor[index]), dq_rad_s=motor.dq,
+                tau_est_nm=motor.tau_est, estimated_torque_limit_nm=limit)
 
 
 def response_metrics(samples, delta, hold_only, speed_deg_s=1.):
@@ -310,6 +335,7 @@ def main():
     publisher = None
     command = None
     aborted = None
+    guard_snapshot = None
     samples = []
     result = None
     stop_verified = False
@@ -416,6 +442,8 @@ def main():
         result = response_metrics(samples, delta, args.hold_only, args.speed_deg_s)
     except Exception as exc:
         aborted = str(exc)
+        if isinstance(exc, MotionStop):
+            guard_snapshot = dict(exc.snapshot, elapsed_s=elapsed, phase=phase)
         emit('abort', reason=aborted)
     finally:
         if publisher is not None:
@@ -439,6 +467,10 @@ def main():
                     break
                 except Exception:
                     time.sleep(.01)
+            # Report the exact failure sample after the disable sequence, so
+            # formatting extra diagnostics cannot postpone disable commands.
+            if guard_snapshot is not None:
+                emit('guard_snapshot', **guard_snapshot)
             emit('disable_feedback', all_29_modes_zero=stop_verified)
         for reader in command_readers:
             reader.Close()

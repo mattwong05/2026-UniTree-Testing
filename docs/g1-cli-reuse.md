@@ -124,7 +124,7 @@ python3 lowlevel_joint_check.py --joint right_knee --delta-deg 1 --speed-deg-s 0
 - `HOLD_SEQUENCE_COMPLETE`：保持序列完成，不代表位移验收通过。
 - `RESPONSE_WITHIN_TEST_LIMITS`：本次响应比 50%–150%、回位偏差不超过 0.5°，且退出禁用确认；仍需现场观察。
 - `RESPONSE_OUTSIDE_TEST_LIMITS`：完成序列但响应指标未达标，退出码为 1。
-- `abort`：保护中止，未完成动作。查看后续 `disable_feedback`；没有全轴禁用确认时由现场处理。
+- `abort`：保护中止，未完成动作。新版为位移、速度、跟随误差和估算力矩保护保存触发瞬间的 `guard_snapshot`，列出轴、实际超限项目、测量值和阈值；该记录在禁用序列之后输出，不是再次动作。查看后续 `disable_feedback`；没有全轴禁用确认时由现场处理。
 
 关节停止、机器人静止后，可复用既有计算功能短测，不要与主动关节测试并发：
 
@@ -133,3 +133,28 @@ timeout -k 5 140 python3 compute_smoke.py --seconds 10 > logs/robot-b/compute.js
 ```
 
 它需要该机现有 NumPy/CUDA/TensorRT 环境，只覆盖有限 CPU/GPU/DLA 自检，不能作为额定 TOPS 或长期热稳定结论。关节索引/增益参考[官方 SDK 示例](https://github.com/unitreerobotics/unitree_sdk2_python/blob/master/example/g1/low_level/g1_low_level_example.py)，机械范围参考[官方 29 轴 URDF](https://github.com/unitreerobotics/unitree_ros/blob/master/robots/g1_description/g1_29dof.urdf)，现场必须核对实际配置。
+
+## 6. 出现报错或没有动作时如何区分
+
+2026-09-20 用户追加终端记录包含多种不同情况，不能把最后一行都当成同一个故障：
+
+| 输出 | 含义与处理 |
+| --- | --- |
+| `preflight`、`execute:false` | 正常只读预检，没有发布动作。`enabled_axes:4` 描述计划，不表示已使能。 |
+| `unrecognized arguments: --excute` | 参数拼写错误，正确为 `--execute`；解析失败时未开始控制。 |
+| `--expect-device-id is required` | 主动命令缺少目标开发板核对。先用 `--device-id` 查看并核对实物，再手动填入；换机重新核对。 |
+| `selected joint tracking/estimated-torque stop` | 旧版合并报错：位置误差超过 0.05 rad（2.86°）或估算力矩超过该轴阈值。不是电机固件错误码。新版分别报告 `tracking` / `estimated_torque`，并保存触发样本。 |
+| `all_29_modes_zero:true` | 该次退出时收到全轴禁用反馈，不证明目标行程完成，也不是之后一直禁用的保证。 |
+| `[Reader] take sample error` | SDK 读取异常的通用提示，单凭这一行不能定位原因。本附件里均出现在预检/停止结果之后，更像退出清理时的读取问题；不能据此否定此前的有效反馈。如果运行中出现并伴随状态超时，需排查通信。 |
+
+附件中的左右肘 `-60° / 5°/秒` 均已进入执行，但最后日志分别只有约 -5.83°、-2.45° 的反馈位移，位置误差为 2.65°、2.75°，随后保护停止。**从趋势推断最可能是跟随误差到达 2.86°，旧日志没有触发瞬间，仍不能排除瞬时估算力矩超限。** 提高目标角度不会增加现有 PD 控制增益或自动解决迟滞；不得把重复执行同样的大行程作为排查方式。摩擦、重力负载、阻尼/增益配置、反馈异常或其他控制程序干扰尚未分离。
+
+调试模式下应使用本页 `lowlevel_joint_check.py` 路线。旧 `upper_body_check.py` 走 `rt/arm_sdk`，依赖上层运控，其 `--joint` 不是只使能一个电机。附件中手腕命令在 `engage` 阶段就因肩轴速度停止，尚未开始手腕目标轨迹；后来 `RPC=3102` 的含义是客户端发送失败，不能据此断言当前 FSM 数值错误。不要为了让旧脚本查询成功而重新启用整机运控。
+
+诊断版可从 Mac 项目目录复制到机上，复制本身不发送动作；替换前应先结束正在运行的测试脚本：
+
+```sh
+scp scripts/lowlevel_joint_check.py unitree@192.168.123.164:/tmp/g1-acceptance-01a0bdf8/
+```
+
+诊断更新只细分停止原因，不更改增益、轨迹或任何保护阈值，不能视为控制跟随问题已解决。先保存当前失败记录，由操作员核对手臂负载/干涉与后台控制程序，再安排小行程复测。SDK 定义见 [RPC 错误码](https://github.com/unitreerobotics/unitree_sdk2_python/blob/master/unitree_sdk2py/rpc/internal.py)和 [DDS Reader 实现](https://github.com/unitreerobotics/unitree_sdk2_python/blob/master/unitree_sdk2py/core/channel.py)。
