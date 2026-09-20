@@ -32,6 +32,7 @@ def cloud(timestamp=1, points=((1, 2, 3),)):
 
 def diagnostic(serial="current-lidar", codes=()):
     return {"hms_checked": True, "hms_codes": list(codes), "serial_number": serial,
+            "lidar_model": "MID360", "product_info": "Mid-360 2021/12/01",
             "diagnostic_at": "2026-09-20T00:00:00+00:00", "warning": "current query only"}
 
 
@@ -283,12 +284,13 @@ class LifecycleTests(unittest.TestCase):
 
 
 class DiagnosticTests(unittest.TestCase):
-    def test_hms_uses_only_query_and_an_ephemeral_port(self):
+    def query_fixture(self, product_info, codes=(0x01040002,)):
         probe = preview._helper("livox_readonly_probe")
         serial = b"current-lidar"
-        entries = [(0x8000, serial), (0x8006, bytes([1])),
-                   (0x8011, struct.pack("<8I", 0x01040002, 0, 0, 0, 0, 0, 0, 0))]
-        payload = bytes([0]) + struct.pack("<H", 3) + b"".join(
+        entries = [(0x8000, serial), (0x8001, product_info.encode("ascii")),
+                   (0x8006, bytes([1])),
+                   (0x8011, struct.pack("<8I", *(tuple(codes) + (0,) * (8 - len(codes)))))]
+        payload = bytes([0]) + struct.pack("<H", len(entries)) + b"".join(
             struct.pack("<HH", key, len(value)) + value for key, value in entries)
         connection = mock.Mock()
         context = mock.MagicMock()
@@ -298,10 +300,65 @@ class DiagnosticTests(unittest.TestCase):
             result = preview.read_hms("192.168.123.120")
         connection.bind.assert_called_once_with(("", 0))
         self.assertEqual(exchange.call_args.args[1:4], ("192.168.123.120", 56100, probe.QUERY))
-        self.assertEqual(exchange.call_args.args[-1], (0x8000, 0x8006, 0x8011))
+        self.assertEqual(exchange.call_args.args[-1], (0x8000, 0x8001, 0x8006, 0x8011))
+        return result
+
+    def test_hms_uses_only_query_and_an_ephemeral_port(self):
+        product_info = "DevType:Mid-360 FmType:App FmVer:13180240 BuildTime:2024/12/17"
+        result = self.query_fixture(product_info)
         self.assertEqual(result["hms_codes"], ["0x01040002"])
         self.assertEqual(result["serial_number"], "current-lidar")
+        self.assertEqual(result["lidar_model"], "MID360")
+        self.assertEqual(result["product_info"], product_info)
         self.assertIn("脏污", result["warning"])
+
+    def test_explicit_product_models_support_current_and_legacy_formats(self):
+        cases = {
+            "Mid-360 2021/12/01": "MID360",
+            "MID360 2026/09/20": "MID360",
+            "DevType:Mid-360 FmType:App FmVer:13180240 BuildTime:2024/12/17": "MID360",
+            "DevType:Mid-360s FmType:App BuildTime:2021/01/01": "MID360s",
+            "MID360s 2026/09/20": "MID360s",
+            " DevType : MID360S ": "MID360s",
+        }
+        for value, expected in cases.items():
+            with self.subTest(product_info=value):
+                self.assertEqual(preview.model_from_product_info(value), expected)
+
+    def test_dates_unknown_tokens_and_conflicting_fields_do_not_identify_models(self):
+        for value in (None, "", "2026/09/20", "BuildTime:2024/12/17", "Mid-360-plus 2026/09/20",
+                      "DevType:Unknown FmType:Mid-360", "Unknown Mid-360 2024/12/17",
+                      "Mid-360 DevType:Mid-360s", "DevType:Mid-360 DevType:Mid-360s",
+                      "DevType:Mid-360\0 FmType:App", "DevType:Mid-360s2"):
+            with self.subTest(product_info=value):
+                self.assertEqual(preview.model_from_product_info(value), "unknown")
+
+    def test_unknown_model_preserves_raw_product_and_does_not_apply_mid360_hms_meaning(self):
+        product_info = "DevType:Other FmType:App BuildTime:2024/12/17"
+        result = self.query_fixture(product_info)
+        self.assertEqual(result["lidar_model"], "unknown")
+        self.assertEqual(result["product_info"], product_info)
+        self.assertEqual(result["hms_codes"], ["0x01040002"])
+        self.assertNotIn("脏污", result["warning"])
+        self.assertIn("型号未确认", result["warning"])
+        self.assertIn("0x01040002", result["warning"])
+
+    def test_mid360s_keeps_its_distinct_model_without_an_unverified_hms_mapping(self):
+        result = self.query_fixture("DevType:Mid-360s FmType:App")
+        self.assertEqual(result["lidar_model"], "MID360s")
+        self.assertNotIn("脏污", result["warning"])
+        self.assertIn("0x01040002", result["warning"])
+
+    def test_initial_and_refreshed_metadata_use_only_current_query_model(self):
+        producer = preview.LidarProducer("eth0", ensure_sdk=mock.Mock())
+        self.assertEqual(producer._status()["lidar_model"], "unknown")
+        self.assertIsNone(producer._status()["product_info"])
+        current = self.query_fixture("Mid-360 2021/12/01")
+        with mock.patch.object(preview, "read_hms", return_value=current), \
+                mock.patch.object(producer._closing, "wait", return_value=True):
+            producer._diagnostic_loop()
+        self.assertEqual(producer._status()["lidar_model"], "MID360")
+        self.assertEqual(producer._status()["product_info"], "Mid-360 2021/12/01")
 
     def test_failed_fresh_query_does_not_reuse_previous_alarm(self):
         producer = preview.LidarProducer("eth0", ensure_sdk=mock.Mock())
@@ -313,6 +370,8 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(producer._hms["hms_codes"], [])
         self.assertIsNone(producer._hms["serial_number"])
         self.assertIsNone(producer._hms["diagnostic_at"])
+        self.assertEqual(producer._status()["lidar_model"], "unknown")
+        self.assertIsNone(producer._status()["product_info"])
         self.assertIn("当前 HMS 未检查", producer._hms["warning"])
 
     def test_serial_change_requires_a_new_verified_session(self):

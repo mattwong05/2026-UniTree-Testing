@@ -116,6 +116,19 @@ class SessionTests(SessionFixture):
         self.assertEqual(self.session.status()["rgb"]["state"], "error")
         self.assertIsNone(self.session.current_frame("rgb"))
 
+    def test_usb_identity_metadata_reaches_status_and_is_cleared_on_restart(self):
+        self.start_capture()
+        identity = {"serial": "TEST_USB", "usb_vid": "8086", "usb_pid": "0b3a",
+                    "usb_speed_mbps": 5000.0, "usb_bus_path": "2-2.2", "usb_sysfs_path": "/sys/example/2-2.2"}
+        self.created["depth"][-1].metadata(identity)
+        for key, value in identity.items():
+            self.assertEqual(self.session.status()["robot"][key], value)
+        self.session.robot.update({key: "old" for key in viewer.RGB_IDENTITY_FIELDS})
+        self.session.stop()
+        self.start_capture()
+        for key in viewer.USB_IDENTITY_FIELDS + viewer.RGB_IDENTITY_FIELDS:
+            self.assertIsNone(self.session.status()["robot"][key])
+
     def test_status_does_not_extend_lease_and_late_heartbeat_cannot_revive(self):
         self.start_capture()
         self.clock.now += 29
@@ -417,9 +430,10 @@ class DiscoveryTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.sysfs = self.root / "video4linux"
         self.sysfs.mkdir()
-        self.usb = self.root / "usb-device"
+        self.usb = self.root / "1-3"
         self.usb.mkdir()
-        for key, value in (("idVendor", "8086"), ("product", "Intel RealSense D435i"), ("serial", "TEST123")):
+        for key, value in (("idVendor", "8086"), ("idProduct", "0b3a"), ("speed", "480"),
+                           ("product", "Intel RealSense D435i"), ("serial", "TEST123")):
             (self.usb / key).write_text(value)
         for node in ("video0", "video1"):
             (self.sysfs / node).mkdir()
@@ -436,6 +450,9 @@ class DiscoveryTests(unittest.TestCase):
         identity = viewer.discover_depth("/tmp/helper", sysfs_root=self.sysfs, runner=runner)
         self.assertEqual(identity["depth_device"], "/dev/video0")
         self.assertEqual(identity["serial"], "TEST123")
+        self.assertEqual((identity["usb_vid"], identity["usb_pid"]), ("8086", "0b3a"))
+        self.assertEqual((identity["usb_speed_mbps"], identity["usb_bus_path"]), (480, "1-3"))
+        self.assertEqual(identity["usb_sysfs_path"], str(self.usb.resolve()))
         for call in runner.call_args_list:
             self.assertEqual(call.args[0][:2], ["/tmp/helper", "--probe"])
         (self.usb / "idVendor").write_text("0000")
@@ -459,6 +476,115 @@ class DiscoveryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             viewer.usb_identity("/tmp/fake-device", self.sysfs)
 
+    def test_missing_or_empty_serial_has_actionable_enumeration_message(self):
+        serial = self.usb / "serial"
+        serial.unlink()
+        with self.assertRaises(viewer.USBEnumerationError) as raised:
+            viewer.usb_identity("/dev/video0", self.sysfs)
+        message = str(raised.exception)
+        self.assertIn("serial", message)
+        self.assertIn("USB 3", message)
+        self.assertNotIn("No such file", message)
+        self.assertNotIn(str(self.root), message)
+        serial.write_text("")
+        with self.assertRaisesRegex(viewer.USBEnumerationError, "序列号为空"):
+            viewer.usb_identity("/dev/video0", self.sysfs)
+
+    def test_vanished_node_and_reenumeration_during_probe_are_explicit(self):
+        link = self.sysfs / "video0" / "device"
+        link.unlink()
+        with self.assertRaisesRegex(viewer.USBEnumerationError, "节点已消失"):
+            viewer.usb_identity("/dev/video0", self.sysfs)
+        link.symlink_to(self.usb, target_is_directory=True)
+        def remove_during_probe(args, **kwargs):
+            link.unlink()
+            return self.probe(args, **kwargs)
+        with self.assertRaisesRegex(viewer.USBEnumerationError, "USB 枚举"):
+            viewer.discover_depth("helper", "/dev/video0", self.sysfs, remove_during_probe, attempts=1)
+
+    def test_usb3_reenumeration_recovers_and_still_selects_only_z16(self):
+        (self.usb / "serial").unlink()
+        stop = mock.Mock()
+        stop.is_set.return_value = False
+        def reenumerate(_delay):
+            usb3 = self.root / "2-2.2"
+            usb3.mkdir()
+            for key, value in (("idVendor", "8086"), ("idProduct", "0b3a"), ("speed", "5000"),
+                               ("product", "Intel RealSense D435i"), ("serial", "TEST_USB3")):
+                (usb3 / key).write_text(value)
+            for index in range(6):
+                node = self.sysfs / ("video%d" % index)
+                node.mkdir(exist_ok=True)
+                link = node / "device"
+                if link.is_symlink():
+                    link.unlink()
+                link.symlink_to(usb3, target_is_directory=True)
+            return False
+        stop.wait.side_effect = reenumerate
+        runner = mock.Mock(side_effect=self.probe)
+        identity = viewer.discover_depth("helper", sysfs_root=self.sysfs, runner=runner, stop=stop)
+        self.assertEqual(identity["depth_device"], "/dev/video0")
+        self.assertEqual((identity["serial"], identity["usb_speed_mbps"], identity["usb_bus_path"]),
+                         ("TEST_USB3", 5000, "2-2.2"))
+        self.assertEqual(identity["camera_name"], "Intel RealSense D435i")
+        self.assertEqual(runner.call_count, 6)
+        stop.wait.assert_called_once_with(0.4)
+
+    def test_unreadable_candidate_cannot_make_another_node_look_unique(self):
+        other = self.root / "2-2.2"
+        other.mkdir()
+        for key, value in (("idVendor", "8086"), ("product", "Intel RealSense D435i")):
+            (other / key).write_text(value)
+        link = self.sysfs / "video1" / "device"
+        link.unlink()
+        link.symlink_to(other, target_is_directory=True)
+        with self.assertRaisesRegex(viewer.USBEnumerationError, "serial"):
+            viewer.discover_depth("helper", sysfs_root=self.sysfs, runner=self.probe, attempts=1)
+
+    def test_enumeration_retry_is_cancellable_before_and_during_probe(self):
+        stop = threading.Event()
+        stop.set()
+        runner = mock.Mock(side_effect=self.probe)
+        with self.assertRaises(viewer.CaptureStopped):
+            viewer.discover_depth("helper", sysfs_root=self.sysfs, runner=runner, stop=stop)
+        runner.assert_not_called()
+        stop.clear()
+        def cancel_probe(args, **kwargs):
+            stop.set()
+            return self.probe(args, **kwargs)
+        with self.assertRaises(viewer.CaptureStopped):
+            viewer.discover_depth("helper", sysfs_root=self.sysfs, runner=cancel_probe, stop=stop)
+        (self.usb / "serial").unlink()
+        waiting = mock.Mock()
+        waiting.is_set.return_value = False
+        waiting.wait.return_value = True
+        with self.assertRaises(viewer.CaptureStopped):
+            viewer.discover_depth("helper", sysfs_root=self.sysfs, runner=self.probe, stop=waiting)
+        waiting.wait.assert_called_once_with(0.4)
+
+    def test_enumeration_retry_budget_is_bounded_and_does_not_accept_another_model(self):
+        clock = [100.0]
+        stop = mock.Mock()
+        stop.is_set.return_value = False
+        def wait(delay):
+            clock[0] += delay
+            return False
+        stop.wait.side_effect = wait
+        def timeout_probe(args, **kwargs):
+            self.assertLessEqual(kwargs["timeout"], 1)
+            clock[0] += kwargs["timeout"]
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+        with mock.patch.object(viewer.time, "monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaisesRegex(viewer.USBEnumerationError, "超时"):
+                viewer.discover_depth("helper", sysfs_root=self.sysfs, runner=timeout_probe, stop=stop)
+        self.assertLessEqual(clock[0], 105.001)
+        self.assertLessEqual(stop.wait.call_count, 2)
+        (self.usb / "product").write_text("Intel RealSense D455")
+        runner = mock.Mock(side_effect=self.probe)
+        with self.assertRaisesRegex(RuntimeError, "identifiable"):
+            viewer.discover_depth("helper", sysfs_root=self.sysfs, runner=runner)
+        runner.assert_not_called()
+
     def test_cli_limits_are_bounded(self):
         self.assertEqual(viewer.parse_args([]).max_session_seconds, 900)
         self.assertEqual(viewer.parse_args(["--max-session-seconds", "15"]).max_session_seconds, 15)
@@ -481,19 +607,32 @@ class RGBAndProcessTests(unittest.TestCase):
         channel_init = mock.Mock()
         modules = {name: types.ModuleType(name) for name in (
             "cv2", "numpy", "unitree_sdk2py", "unitree_sdk2py.core", "unitree_sdk2py.core.channel",
-            "unitree_sdk2py.go2", "unitree_sdk2py.go2.video", "unitree_sdk2py.go2.video.video_client")}
+            "unitree_sdk2py.go2", "unitree_sdk2py.go2.video", "unitree_sdk2py.go2.video.video_client",
+            "video_service")}
         modules["unitree_sdk2py.core.channel"].ChannelFactoryInitialize = channel_init
         modules["unitree_sdk2py.go2.video.video_client"].VideoClient = client_type
+        def lease():
+            service = mock.Mock()
+            service.start.side_effect = lambda _stop, identity_check: identity_check()
+            service.status.return_value = {"phase": "running"}
+            service.close.return_value = None
+            return service
+        modules["video_service"].VideoServiceLease = mock.Mock(side_effect=lease)
+        modules["video_service"].configured_camera_identity = mock.Mock(
+            return_value={"rgb_device": "/dev/video4", "rgb_serial": "TEST_RGB"})
         with mock.patch.dict(sys.modules, modules), \
                 mock.patch.object(viewer, "SDK_INTERFACE", None), \
                 mock.patch.object(viewer.RGBProducer, "_client", None):
             for _ in range(3):
                 stop.clear()
-                viewer.RGBProducer("eth0").run(mock.Mock(), stop, mock.Mock())
+                producer = viewer.RGBProducer("eth0")
+                producer.run(mock.Mock(), stop, mock.Mock())
+                producer.close()
             channel_init.assert_called_once_with(0, "eth0")
             client_type.assert_called_once_with()
             client.Init.assert_called_once_with()
             self.assertEqual(client.GetImageSample.call_count, 3)
+            stop.clear()
             with self.assertRaisesRegex(RuntimeError, "interface cannot change"):
                 viewer.RGBProducer("eth1").run(mock.Mock(), stop, mock.Mock())
 

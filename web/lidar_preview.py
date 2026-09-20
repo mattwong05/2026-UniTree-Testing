@@ -47,6 +47,31 @@ def _utc_now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def model_from_product_info(product_info):
+    """Recognize an explicit model token, never a build/production date.
+
+    MID360 protocol key 0x8001 documents the legacy "Mid-360 2021/12/01"
+    format. Current hardware also returns "DevType:Mid-360 FmType:...".
+    Other tokens and conflicting/repeated DevType fields remain unknown.
+    """
+    if not isinstance(product_info, str):
+        return "unknown"
+    text = product_info.strip()
+    if not text or "\0" in text:
+        return "unknown"
+    model_names = {"mid-360": "MID360", "mid360": "MID360",
+                   "mid-360s": "MID360s", "mid360s": "MID360s"}
+    fields = re.findall(r"(?:^|\s)DevType\s*:", text, flags=re.IGNORECASE)
+    if fields:
+        match = re.match(r"DevType\s*:\s*(\S+)", text, flags=re.IGNORECASE)
+        if len(fields) != 1 or match is None:
+            return "unknown"
+        token = match.group(1)
+    else:
+        token = text.split()[0]
+    return model_names.get(token.casefold(), "unknown")
+
+
 def read_hms(lidar_ip):
     """One allowlisted query from an ephemeral port; never claim a cached result.
 
@@ -55,7 +80,7 @@ def read_hms(lidar_ip):
     to driver ports, configuration, or work-mode command is performed.
     """
     probe = _helper("livox_readonly_probe")
-    keys = (0x8000, 0x8006, 0x8011)
+    keys = (0x8000, 0x8001, 0x8006, 0x8011)
     sequence = 1 + time.monotonic_ns() % 0xFFFF
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
         connection.bind(("", 0))
@@ -65,16 +90,23 @@ def read_hms(lidar_ip):
     serial = values["serial_number"]
     if not serial:
         raise ValueError("HMS reply has no LiDAR serial number")
+    product_info = values["product_info"]
+    model = model_from_product_info(product_info)
     codes = [item["code"] for item in values["hms_nonzero"]]
     warnings = []
     for code in codes:
-        if code == "0x01040002":
+        # This meaning is documented by the MID360-specific HMS table. A topic
+        # name, another model, or an unrecognized product must not select it.
+        if model == "MID360" and code == "0x01040002":
             warnings.append("光学窗口脏污警告 0x01040002，可能影响点云可靠性")
         else:
-            warnings.append("HMS 告警 " + code + "，需查厂家说明")
+            warnings.append("HMS 告警 " + code + "，需查该型号厂家说明")
+    warning = "；".join(warnings) if warnings else "本次只读查询未发现非零 HMS 告警"
+    if model == "unknown":
+        warning += "；雷达型号未确认"
     return {"hms_checked": True, "hms_codes": codes, "serial_number": serial,
-            "diagnostic_at": _utc_now(),
-            "warning": "；".join(warnings) if warnings else "本次只读查询未发现非零 HMS 告警"}
+            "lidar_model": model, "product_info": product_info,
+            "diagnostic_at": _utc_now(), "warning": warning}
 
 
 def validate_message(message):
@@ -146,6 +178,7 @@ class LidarProducer:
         self._receive_times = deque(maxlen=100)
         self._serial = None
         self._hms = {"hms_checked": False, "hms_codes": [], "serial_number": None,
+                     "lidar_model": "unknown", "product_info": None,
                      "diagnostic_at": None, "warning": "当前 HMS 未检查"}
         self._service = {"name": SERVICE, "initial": None, "current": None,
                          "owned_start": False, "restore_required": False,
@@ -216,6 +249,7 @@ class LidarProducer:
                 result = read_hms(self.lidar_ip)
             except Exception as error:
                 result = {"hms_checked": False, "hms_codes": [], "serial_number": None,
+                          "lidar_model": "unknown", "product_info": None,
                           "diagnostic_at": None,
                           "warning": "当前 HMS 未检查：" + str(error)[:200]}
             with self._data_lock:
@@ -240,7 +274,7 @@ class LidarProducer:
                           received_hz=round((len(times) - 1) / (times[-1] - times[0]), 3)
                           if len(times) > 1 and times[-1] > times[0] else 0)
         result.update(lidar_ip=self.lidar_ip, lidar_serial=result["serial_number"],
-                      lidar_model="MID360 topic; identity from current query only", service_state=service)
+                      service_state=service)
         return result
 
     def _emit_metadata(self):

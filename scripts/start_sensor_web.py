@@ -20,6 +20,7 @@ import webbrowser
 
 
 ROOT = Path(__file__).resolve().parents[1]
+RUNTIME_MARKER = "G1_SENSOR_RUNTIME="
 
 
 def parse_args(argv=None):
@@ -62,8 +63,51 @@ def parse_args(argv=None):
     return args
 
 
-def remote_server_command(remote_dir, args):
-    command = ["python3", "-u", remote_dir + "/sensor_server.py",
+def dependency_probe_program(host, user):
+    # A -c probe can import an SDK from SSH's cwd even when a /tmp script cannot.
+    # Preserve its actual package parent and interpreter for the server process.
+    return "\n".join([
+        "import os,getpass,json,sys,pathlib",
+        "peer=os.environ.get('SSH_CONNECTION','').split()",
+        "assert len(peer)==4 and peer[2]==%r and getpass.getuser()==%r, "
+        "'SSH session target differs from requested robot'" % (host, user),
+        "assert sys.version_info >= (3,8), 'Python 3.8 or newer is required'",
+        "import cv2,numpy,unitree_sdk2py",
+        "from cyclonedds.qos import Qos,Policy",
+        "from unitree_sdk2py.core.channel import ChannelFactory,ChannelFactoryInitialize",
+        "from unitree_sdk2py.go2.video.video_client import VideoClient",
+        "from unitree_sdk2py.go2.robot_state.robot_state_client import RobotStateClient",
+        "from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_",
+        "origin=getattr(unitree_sdk2py,'__file__',None)",
+        "assert origin, 'SDK must have a concrete package location'",
+        "package=pathlib.Path(origin).resolve(strict=True).parent",
+        "assert package.name=='unitree_sdk2py', 'Unexpected SDK package location'",
+        "runtime={'python':sys.executable,'sdk_parent':str(package.parent)}",
+        "print(%r+json.dumps(runtime))" % RUNTIME_MARKER,
+    ])
+
+
+def parse_remote_runtime(output):
+    records = [line[len(RUNTIME_MARKER):] for line in output.splitlines()
+               if line.startswith(RUNTIME_MARKER)]
+    try:
+        if len(records) != 1:
+            raise ValueError("expected one runtime record")
+        runtime = json.loads(records[0])
+        for name in ("python", "sdk_parent"):
+            value = runtime[name]
+            if (not isinstance(value, str) or not value.startswith("/") or
+                    any(ord(char) < 32 or ord(char) == 127 for char in value)):
+                raise ValueError("invalid absolute runtime path")
+        if ":" in runtime["sdk_parent"]:
+            raise ValueError("SDK parent cannot contain the PYTHONPATH separator")
+        return runtime
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("Remote Python/SDK dependency paths could not be verified") from error
+
+
+def remote_server_command(remote_dir, args, runtime):
+    command = [runtime["python"], "-u", remote_dir + "/sensor_server.py",
                "--host-label", args.host, "--port", str(args.remote_port),
                "--instance-id", Path(remote_dir).name,
                "--depth-binary", remote_dir + "/depth_frame_check",
@@ -71,7 +115,9 @@ def remote_server_command(remote_dir, args):
                "--lidar-ip", args.lidar_ip,
                "--web-root", remote_dir]
     # PID belongs to this shell and is preserved by exec. No unrelated PID is killed.
-    return "umask 077; printf '%s\\n' \"$$\" > " + shlex.quote(remote_dir + "/server.pid") + "; exec " + shlex.join(command)
+    return ("umask 077; printf '%s\\n' \"$$\" > " + shlex.quote(remote_dir + "/server.pid") +
+            "; export PYTHONPATH=" + shlex.quote(runtime["sdk_parent"]) +
+            '"${PYTHONPATH:+:$PYTHONPATH}"; exec ' + shlex.join(command))
 
 
 def cleanup_program(remote_dir):
@@ -87,7 +133,7 @@ def cleanup_program(remote_dir):
         "    return str(root/'sensor_server.py').encode() in args",
         "if pid>1 and belongs():",
         "    os.kill(pid,signal.SIGTERM)",
-        "    for _ in range(400):",
+        "    for _ in range(550):",
         "        if not belongs(): break",
         "        time.sleep(.1)",
         "    if belongs():",
@@ -128,7 +174,8 @@ class Launcher:
             if not shutil.which(binary):
                 raise RuntimeError("Required local command missing: " + binary)
         files = [ROOT / "web/sensor_server.py", ROOT / "web/index.html",
-                 ROOT / "web/lidar_preview.py", ROOT / "scripts/depth_frame_check.c",
+                 ROOT / "web/lidar_preview.py", ROOT / "web/video_service.py",
+                 ROOT / "scripts/depth_frame_check.c",
                  ROOT / "scripts/lidar_cloud_check.py", ROOT / "scripts/livox_readonly_probe.py"]
         for file in files:
             if not file.is_file():
@@ -147,14 +194,15 @@ class Launcher:
             subprocess.run(["ssh", *self.options, "-O", "check", self.target], check=True)
         self.master_ready = True
         print("检查机载依赖并准备临时采集服务……", flush=True)
-        identity_check = ("import os,getpass; "
-                          "peer=os.environ.get('SSH_CONNECTION','').split(); "
-                          "assert len(peer)==4 and peer[2]==%r and getpass.getuser()==%r, "
-                          "'SSH session target differs from requested robot'; "
-                          "import cv2,numpy,unitree_sdk2py; "
-                          "print('Robot connection identity and existing dependencies verified')") % (self.args.host, self.args.user)
-        self.run_ssh("python3 -c " + shlex.quote(identity_check) +
-                     " && command -v gcc", timeout=15)
+        try:
+            probe = self.run_ssh("python3 -c " + shlex.quote(
+                dependency_probe_program(self.args.host, self.args.user)),
+                timeout=15, capture_output=True, text=True)
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError("Remote dependency check failed: " +
+                               (error.stderr or "Python import failed").strip()[-2000:]) from error
+        runtime = parse_remote_runtime(probe.stdout)
+        self.run_ssh("command -v gcc", timeout=15)
         self.run_ssh("umask 077; mkdir -p " + shlex.quote(self.remote_dir), timeout=12)
         self.uploaded = True
         subprocess.run(["scp", "-o", "ControlPath=" + self.control, "-o", "BatchMode=yes",
@@ -165,7 +213,7 @@ class Launcher:
                                  self.remote_dir + "/depth_frame_check"]), timeout=30)
         self.process = subprocess.Popen([
             "ssh", *self.options, "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
-            "-L", self.forward, self.target, remote_server_command(self.remote_dir, self.args)],
+            "-L", self.forward, self.target, remote_server_command(self.remote_dir, self.args, runtime)],
             start_new_session=True)
         url = "http://127.0.0.1:%d" % self.args.port
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -200,7 +248,7 @@ class Launcher:
             try:
                 if self.master_ready and self.uploaded:
                     try:
-                        self.run_ssh("python3 -c " + shlex.quote(cleanup_program(self.remote_dir)), timeout=45)
+                        self.run_ssh("python3 -c " + shlex.quote(cleanup_program(self.remote_dir)), timeout=60)
                     except (OSError, subprocess.SubprocessError, KeyboardInterrupt):
                         self.cleanup_failed = True
                         print("SSH 清理未确认；请核对机上采集和雷达驱动状态。", file=sys.stderr)

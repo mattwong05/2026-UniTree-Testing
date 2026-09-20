@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Loopback-only G1 sensor viewer; Python 3.8 standard-library HTTP server.
 
-RGB reads the existing videohub. Depth uses the adjacent bounded V4L2 helper.
-LiDAR temporarily starts its driver when needed and restores its initial state.
+RGB reads the manufacturer head videohub. Depth uses a bounded V4L2 helper.
+Video and LiDAR temporarily start their services and restore initial states.
 No movement, calibration, reset, or unrelated service changes are made.
 """
 import argparse
@@ -34,7 +34,7 @@ MAX_SESSION_SECONDS = 900
 DEPTH_HEADER = struct.Struct("<4sIIIQI")
 SCALE_LABEL = "原始深度单位 300–5000；未经距离标定；黑色为无有效数据"
 LIDAR_DETAIL_FIELDS = ("point_count", "display_points", "frame_id", "warning", "service_state",
-                       "lidar_ip", "serial_number", "diagnostic_at", "hms_codes", "hms_checked",
+                       "lidar_ip", "lidar_model", "product_info", "serial_number", "diagnostic_at", "hms_codes", "hms_checked",
                        "received_frames", "received_hz", "timestamp_errors", "decode_errors",
                        "valid_points", "source_timestamp_ns")
 SDK_LOCK = threading.Lock()
@@ -63,6 +63,20 @@ class CaptureStopped(Exception):
     pass
 
 
+class USBEnumerationError(RuntimeError):
+    """USB identity is incomplete or changed while it was being inspected."""
+
+
+USB_IDENTITY_FIELDS = ("usb_vid", "usb_pid", "usb_speed_mbps", "usb_bus_path", "usb_sysfs_path")
+RGB_IDENTITY_FIELDS = ("rgb_service_state", "rgb_source", "rgb_device", "rgb_serial")
+
+
+def usb_enumeration_error(device, detail):
+    return USBEnumerationError(
+        "USB 枚举尚未稳定（%s）：%s；请检查相机供电和 USB 3 数据线，"
+        "等待重枚举完成后重新连接预览。" % (device, detail))
+
+
 def utc_now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
@@ -71,45 +85,117 @@ def usb_identity(device, sysfs_root=Path("/sys/class/video4linux")):
     if not re.fullmatch(r"/dev/video[0-9]+", device):
         raise ValueError("Depth device must be an explicit /dev/videoN node")
     link = sysfs_root / Path(device).name / "device"
-    if not link.exists():
-        raise RuntimeError("Depth node is missing from sysfs: " + device)
-    current = link.resolve()
+    try:
+        current = link.resolve(strict=True)
+    except OSError:
+        raise usb_enumeration_error(device, "video 节点已消失或尚未完成注册") from None
     for parent in (current,) + tuple(current.parents):
         vendor = parent / "idVendor"
         if vendor.is_file():
-            name = (parent / "product").read_text().strip()
-            serial = (parent / "serial").read_text().strip()
-            if vendor.read_text().strip().lower() != "8086" or "435i" not in name.lower() or not serial:
-                raise RuntimeError("Depth node is not an identifiable Intel RealSense D435i")
+            try:
+                vid = vendor.read_text().strip().lower()
+                if vid != "8086":
+                    raise RuntimeError("Depth node is not an identifiable Intel RealSense D435i")
+                name = (parent / "product").read_text().strip()
+                if "435i" not in name.lower():
+                    raise RuntimeError("Depth node is not an identifiable Intel RealSense D435i")
+                serial = (parent / "serial").read_text().strip()
+                pid = (parent / "idProduct").read_text().strip().lower()
+                speed = float((parent / "speed").read_text().strip())
+                if not serial:
+                    raise usb_enumeration_error(device, "USB serial 序列号为空，不能确认相机身份")
+                if not re.fullmatch(r"[0-9a-f]{4}", pid) or not math.isfinite(speed) or speed <= 0:
+                    raise usb_enumeration_error(device, "USB VID/PID 或速率描述符不完整")
+                if link.resolve(strict=True) != current:
+                    raise usb_enumeration_error(device, "video 节点在识别期间发生重枚举")
+            except (OSError, ValueError) as error:
+                attribute = Path(error.filename).name if isinstance(error, OSError) and error.filename else "USB 描述符"
+                raise usb_enumeration_error(device, attribute + " 无法读取或尚未就绪") from None
             return {"camera_name": name, "serial": serial, "depth_device": device,
+                    "usb_vid": vid, "usb_pid": pid, "usb_speed_mbps": speed,
+                    "usb_bus_path": parent.name, "usb_sysfs_path": str(parent),
                     "identity_source": "USB sysfs; RGB RPC does not carry a camera serial"}
+    if not link.exists():
+        raise usb_enumeration_error(device, "USB 设备在识别期间断开")
     raise RuntimeError("No USB camera identity for " + device)
 
 
-def discover_depth(binary, device="auto", sysfs_root=Path("/sys/class/video4linux"), runner=subprocess.run):
+def _discover_depth_once(binary, device, sysfs_root, runner, stop, deadline):
     candidates = [device] if device != "auto" else [
         "/dev/" + path.name for path in sorted(sysfs_root.glob("video*"))
         if re.fullmatch(r"video[0-9]+", path.name)]
-    found, failures = [], []
+    if not candidates:
+        raise usb_enumeration_error(device, "没有 video 节点；相机可能未连接或正在重枚举")
+    found, failures, transient = [], [], []
     for candidate in candidates:
+        if stop.is_set():
+            raise CaptureStopped()
         try:
             identity = usb_identity(candidate, sysfs_root)
+        except USBEnumerationError as error:
+            transient.append(str(error))
+            continue
+        except RuntimeError as error:
+            failures.append(str(error))
+            continue
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise usb_enumeration_error(candidate, "USB 身份和唯一 Z16 节点检查超时")
             reply = runner([str(binary), "--probe", candidate], capture_output=True,
-                           text=True, timeout=3, check=False)
+                           text=True, timeout=min(1.0, remaining), check=False)
+            if stop.is_set():
+                raise CaptureStopped()
             if reply.returncode != 0:
-                raise RuntimeError("Depth probe failed: " + reply.stderr[-300:].strip())
+                raise usb_enumeration_error(candidate, "深度节点只读探测失败：" + reply.stderr[-200:].strip())
             info = json.loads(reply.stdout)
+            if not isinstance(info, dict):
+                raise ValueError("Probe JSON must be an object")
             if info.get("device") != candidate:
                 raise RuntimeError("Depth probe returned a different device")
+            if usb_identity(candidate, sysfs_root) != identity:
+                raise usb_enumeration_error(candidate, "相机身份在只读探测期间发生变化")
             if info.get("usable_depth") is True and info.get("z16") is True:
                 found.append(identity)
-        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
-            failures.append(str(error))
+        except USBEnumerationError as error:
+            transient.append(str(error))
+        except subprocess.TimeoutExpired:
+            transient.append(str(usb_enumeration_error(candidate, "深度节点只读探测超时")))
+        except OSError:
+            raise RuntimeError("Depth probe executable is unavailable; restart the viewer to upload it again") from None
+        except ValueError:
+            raise RuntimeError("Depth probe returned invalid JSON; restart the viewer to upload it again") from None
+    if len(found) > 1:
+        raise RuntimeError("Expected exactly one identifiable D435i Z16 node; found %d" % len(found))
+    if transient:
+        # An unreadable candidate might be another depth node. Do not select a
+        # seemingly unique node until the whole enumeration is stable.
+        raise USBEnumerationError(transient[-1])
     if len(found) != 1:
         detail = "; ".join(failures[-2:])
         raise RuntimeError("Expected exactly one identifiable D435i Z16 node; found %d. %s" %
                            (len(found), detail))
     return found[0]
+
+
+def discover_depth(binary, device="auto", sysfs_root=Path("/sys/class/video4linux"), runner=subprocess.run,
+                   stop=None, attempts=3, retry_delay=0.4):
+    """Retry only incomplete enumeration, with a five-second total probe budget."""
+    if not 1 <= attempts <= 3:
+        raise ValueError("USB enumeration attempts must be between 1 and 3")
+    stop = stop if stop is not None else threading.Event()
+    deadline = time.monotonic() + 5.0
+    for attempt in range(attempts):
+        if stop.is_set():
+            raise CaptureStopped()
+        try:
+            return _discover_depth_once(binary, device, sysfs_root, runner, stop, deadline)
+        except USBEnumerationError:
+            remaining = deadline - time.monotonic()
+            if attempt + 1 == attempts or remaining <= 0:
+                raise
+            if stop.wait(min(retry_delay, remaining)):
+                raise CaptureStopped()
 
 
 class RGBProducer:
@@ -118,12 +204,25 @@ class RGBProducer:
 
     def __init__(self, interface="eth0"):
         self.interface = interface
+        self.service = None
+        self.metadata = None
+        self.closing = threading.Event()
 
     def run(self, publish, stop, metadata):
         import cv2
         import numpy as np
         from unitree_sdk2py.go2.video.video_client import VideoClient
+        from video_service import VideoServiceLease, configured_camera_identity
+        self.metadata = metadata
+        self.service = VideoServiceLease()
+        if self.closing.is_set() or stop.is_set():
+            return
         ensure_sdk(self.interface)
+        identity = self.service.start(stop, lambda: configured_camera_identity(usb_identity))
+        metadata(dict(identity, rgb_service_state=self.service.status(),
+                      rgb_source=identity.get("rgb_source", "manufacturer head video RPC")))
+        if self.closing.is_set() or stop.is_set():
+            return
         with self._client_lock:
             if self.__class__._client is None:
                 client = VideoClient()
@@ -131,12 +230,17 @@ class RGBProducer:
                 client.Init()
                 self.__class__._client = client
             client = self.__class__._client
-        while not stop.is_set():
+        startup_deadline = time.monotonic() + 8
+        received = False
+        while not stop.is_set() and not self.closing.is_set():
             begin = time.monotonic()
             code, data = client.GetImageSample()
             if stop.is_set():
                 break
             if code != 0 or not data:
+                if not received and time.monotonic() < startup_deadline:
+                    stop.wait(0.2)
+                    continue
                 raise RuntimeError("RGB GetImageSample failed (code %s)" % code)
             jpeg = bytes(data)
             if len(jpeg) > 16 * 1024 * 1024:
@@ -153,11 +257,15 @@ class RGBProducer:
                     raise RuntimeError("RGB JPEG encoding failed")
                 jpeg = encoded.tobytes()
             publish(jpeg, width, height)
+            received = True
             stop.wait(max(0, 0.1 - (time.monotonic() - begin)))
 
     def close(self):
-        # RPC polling stops; the manufacturer's videohub remains running.
-        return None
+        self.closing.set()
+        warning = self.service.close() if self.service else None
+        if self.service and self.metadata:
+            self.metadata({"rgb_service_state": self.service.status()})
+        return warning
 
 
 def read_exact(stream, length, stop, timeout=3.0):
@@ -231,7 +339,7 @@ class DepthProducer:
     def run(self, publish, stop, metadata):
         import cv2
         import numpy as np
-        identity = discover_depth(self.binary, self.device)
+        identity = discover_depth(self.binary, self.device, stop=stop)
         metadata(identity)
         with tempfile.TemporaryFile() as errors:
             with self.lock:
@@ -296,6 +404,7 @@ class CameraSession:
         self.clock, self.factories = clock, factories
         self.max_seconds = max_seconds
         self.robot = {"host": host, "camera_name": None, "serial": None, "depth_device": None}
+        self.robot.update({key: None for key in USB_IDENTITY_FIELDS + RGB_IDENTITY_FIELDS})
         self.condition = threading.Condition()
         self.lifecycle = threading.Lock()
         self.running = False
@@ -343,6 +452,7 @@ class CameraSession:
                 generation = self.generation
                 self.streams = {name: self.empty_stream() for name in self.factories}
                 self.robot.update(camera_name=None, serial=None, depth_device=None)
+                self.robot.update({key: None for key in USB_IDENTITY_FIELDS + RGB_IDENTITY_FIELDS})
                 if "lidar" in self.factories:
                     self.robot.update(lidar_ip=None, lidar_serial=None, lidar_model=None)
                 self.last_error = None
@@ -397,6 +507,9 @@ class CameraSession:
                 self.streams[name]["metadata"].update(info)
                 self.robot.update({key: value for key, value in info.items()
                                    if key in ("lidar_ip", "lidar_serial", "lidar_model")})
+            elif name == "rgb":
+                self.streams[name]["metadata"].update(info)
+                self.robot.update({key: value for key, value in info.items() if key.startswith("rgb_")})
             elif self.running:
                 self.robot.update(info)
 
@@ -493,6 +606,9 @@ class CameraSession:
                 if name == "depth":
                     result[name].update(nonzero_fraction=frame["nonzero_fraction"] if frame else None,
                                         scale_label=SCALE_LABEL)
+                if name == "rgb":
+                    result[name].update(service_state=stream["metadata"].get("rgb_service_state"),
+                                        source=stream["metadata"].get("rgb_source"))
                 if name == "lidar":
                     details = dict(frame["payload"]) if frame else {}
                     details.update(stream["metadata"])
