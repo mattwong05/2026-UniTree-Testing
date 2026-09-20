@@ -44,6 +44,37 @@ class TrajectoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             arm.trajectory(-1)
 
+    def test_hold_only_never_requests_joint_motion(self):
+        for step in range(10001):
+            weight, offset, _ = arm.trajectory(step / 1000, hold_only=True)
+            self.assertGreaterEqual(weight, 0)
+            self.assertLessEqual(weight, 1)
+            self.assertEqual(offset, 0)
+        self.assertEqual(arm.trajectory(5.5, hold_only=True), (1, 0, "hold_baseline"))
+        self.assertEqual(arm.trajectory(9, hold_only=True), (0, 0, "released"))
+
+    def test_selected_joint_only_changes_fixed_reference(self):
+        anchor = [0.1 * i for i in range(29)]
+        original = list(anchor)
+        for index in range(15, 29):
+            for delta in (-arm.DELTA, 0, arm.DELTA):
+                targets = arm.command_targets(anchor, index, delta)
+                for other in arm.UPPER:
+                    self.assertAlmostEqual(targets[other]-anchor[other], delta if other == index else 0)
+        self.assertEqual(anchor, original)
+
+    def test_pasted_failures_are_velocity_stops(self):
+        for q, dq, initial in ((0.201191172, 0.7838642, 0.191268235),
+                               (0.194875494, 1.05077684, 0.182615623)):
+            violations = arm.motion_violations(q, dq, q, initial)
+            self.assertEqual([v["metric"] for v in violations], ["velocity_rad_s"])
+            self.assertEqual(violations[0]["limit"], 0.6)
+
+    def test_each_motion_guard_remains_active(self):
+        self.assertEqual(arm.motion_violations(0, 0.6, 0, 0), [])
+        self.assertEqual(arm.motion_violations(0.16, 0, 0, 0.16)[0]["metric"], "tracking_error_rad")
+        self.assertEqual(arm.motion_violations(0.16, 0, 0.16, 0)[0]["metric"], "displacement_rad")
+
     def test_targets_respect_joint_bounds_in_both_directions(self):
         for name, (_, lower, upper) in arm.JOINTS.items():
             with self.subTest(joint=name):
@@ -74,7 +105,7 @@ class TrajectoryTests(unittest.TestCase):
         self.assertIn('"left_wrist_yaw": 21', result.stdout)
 
     def test_invalid_cli_rejected_before_sdk_import(self):
-        for args in (("--execute", "--check-all"), ("--delta-deg", "nan"),
+        for args in (("--execute", "--check-all"), ("--hold-only", "--check-all"), ("--delta-deg", "nan"),
                      ("--delta-deg", "6"), ("--joint", "waist_yaw")):
             result = subprocess.run([sys.executable, str(SCRIPT), *args],
                                     capture_output=True, text=True, timeout=5)
