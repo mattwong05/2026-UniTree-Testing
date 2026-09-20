@@ -21,6 +21,26 @@ def tensor(fmt="INT8"):
 class Int8BenchmarkTests(unittest.TestCase):
     def test_operation_count_is_dense_mac_twice(self):
         self.assertEqual(bench.NOMINAL_OPS, 4294967296)
+        self.assertEqual(bench.workload_dimensions(32), ((1, 512, 32, 32), 4294967296))
+        self.assertEqual(bench.workload_dimensions(64), ((1, 512, 64, 64), 17179869184))
+        with self.assertRaises(ValueError):
+            bench.workload_dimensions(128)
+
+    def test_spatial_cli_is_bounded_and_gpu_only(self):
+        self.assertEqual(bench.parse_args([]).spatial, 32)
+        self.assertEqual(bench.parse_args(["--target", "gpu", "--spatial", "64"]).spatial, 64)
+        for args in (("--spatial", "64"), ("--spatial", "128", "--target", "gpu"),
+                     ("--spatial", "64", "--target", "dla0"),
+                     ("--spatial", "64", "--target", "dla1")):
+            with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    bench.parse_args(args)
+
+    def test_spatial_64_dla_rejected_before_hardware_access(self):
+        with mock.patch.object(bench, "ThermalGuard") as guard:
+            with self.assertRaises(ValueError):
+                bench.benchmark("dla0", 5, False, 100, spatial=64)
+        guard.assert_not_called()
 
     def test_cli_load_limits(self):
         self.assertEqual(bench.parse_args([]).seconds, 10)

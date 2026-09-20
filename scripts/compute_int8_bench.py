@@ -17,9 +17,18 @@ import time
 
 CHANNELS = 512
 LAYERS = 8
-SHAPE = (1, CHANNELS, 32, 32)
-NOMINAL_OPS = LAYERS * 2 * CHANNELS * CHANNELS * 32 * 32
 STOP_TEMPERATURE_C = 75
+
+
+def workload_dimensions(spatial):
+    if spatial not in (32, 64):
+        raise ValueError("spatial must be 32 or 64")
+    shape = (1, CHANNELS, spatial, spatial)
+    nominal_ops = LAYERS * 2 * CHANNELS * CHANNELS * spatial * spatial
+    return shape, nominal_ops
+
+
+SHAPE, NOMINAL_OPS = workload_dimensions(32)
 
 
 def emit(**record):
@@ -44,7 +53,7 @@ def read_temperature(root=Path("/sys/class/thermal")):
 
 
 class ThermalGuard:
-    """Fail closed even during a long native TensorRT build or execution call."""
+    """Monitor temperature and phase deadlines when the Python thread can run."""
 
     def __init__(self, target):
         self.target = target
@@ -156,7 +165,10 @@ class Cuda:
         return value.value
 
 
-def benchmark(target, seconds, sparse, window_iterations):
+def benchmark(target, seconds, sparse, window_iterations, spatial=32):
+    shape, nominal_ops = workload_dimensions(spatial)
+    if spatial == 64 and target != "gpu":
+        raise ValueError("--spatial 64 requires --target gpu")
     with ThermalGuard(target) as guard:
         import numpy as np
         import tensorrt as trt
@@ -192,7 +204,7 @@ def benchmark(target, seconds, sparse, window_iterations):
 
         network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
         boundary_dtype = trt.float16 if target == "gpu" else trt.int8
-        tensor = network.add_input("input", boundary_dtype, SHAPE)
+        tensor = network.add_input("input", boundary_dtype, shape)
         tensor.allowed_formats = 1 << int(trt.TensorFormat.LINEAR)
         tensor.dynamic_range = (-1.0, 1.0)
         weights = make_weights(np, sparse)
@@ -230,8 +242,8 @@ def benchmark(target, seconds, sparse, window_iterations):
         emit(kind="engine", target=target, tensorrt=trt.__version__,
              cuda_runtime=cuda.version("cudaRuntimeGetVersion"),
              cuda_driver=cuda.version("cudaDriverGetVersion"), dla_cores=builder.num_DLA_cores,
-             shape=SHAPE, convolution_layers=LAYERS, kernel=[1, 1],
-             nominal_ops=NOMINAL_OPS, ops_convention="dense-equivalent; multiply=1, add=1",
+             shape=shape, convolution_layers=LAYERS, kernel=[1, 1],
+             nominal_ops=nominal_ops, ops_convention="dense-equivalent; multiply=1, add=1",
              sparse_weights=sparse, sparse_tactic_selected="not independently verified" if sparse else "not requested",
              gpu_fallback_enabled=False, boundary_dtype=str(boundary_dtype),
              dynamic_range=[-1.0, 1.0], build_seconds=build_seconds,
@@ -242,7 +254,7 @@ def benchmark(target, seconds, sparse, window_iterations):
             raise RuntimeError("TensorRT context creation failed")
         host_dtype = np.float16 if target == "gpu" else np.int8
         input_value = 64.0 / 127 if target == "gpu" else 64
-        host_input = np.full(SHAPE, input_value, dtype=host_dtype)
+        host_input = np.full(shape, input_value, dtype=host_dtype)
         host_output = np.empty_like(host_input)
         pointers, events = [], []
         stream = ct.c_void_p()
@@ -251,7 +263,7 @@ def benchmark(target, seconds, sparse, window_iterations):
             for name, array in (("input", host_input), ("output", host_output)):
                 binding = engine.get_binding_index(name)
                 if (binding < 0 or engine.get_binding_format(binding) != trt.TensorFormat.LINEAR
-                        or tuple(engine.get_binding_shape(binding)) != SHAPE
+                        or tuple(engine.get_binding_shape(binding)) != shape
                         or engine.get_binding_dtype(binding) != boundary_dtype):
                     raise RuntimeError("Unexpected boundary shape, dtype or non-LINEAR format")
                 pointer = ct.c_void_p()
@@ -317,8 +329,8 @@ def benchmark(target, seconds, sparse, window_iterations):
                 per_iteration = wall_seconds / iterations
                 emit(kind="window", target=target, index=windows, iterations=iterations,
                      wall_seconds=wall_seconds, cuda_event_seconds=event_seconds,
-                     wall_dense_equivalent_tops=iterations * NOMINAL_OPS / wall_seconds / 1e12,
-                     cuda_event_dense_equivalent_tops=iterations * NOMINAL_OPS / event_seconds / 1e12,
+                     wall_dense_equivalent_tops=iterations * nominal_ops / wall_seconds / 1e12,
+                     cuda_event_dense_equivalent_tops=iterations * nominal_ops / event_seconds / 1e12,
                      temperature_c=guard.current)
             elapsed = time.monotonic() - started
             guard.set_stage("final_verification_and_cleanup", 10)
@@ -329,12 +341,12 @@ def benchmark(target, seconds, sparse, window_iterations):
             emit(kind="summary", target=target, result="PASS", meaning="synthetic execution and limited numerical checks passed; not 100 TOPS certification",
                  precision_evidence=precision_evidence, sparse_weights=sparse,
                  requested_seconds=seconds, benchmark_elapsed_seconds=elapsed,
-                 measured_iterations=count, windows=windows, nominal_ops=NOMINAL_OPS,
+                 measured_iterations=count, windows=windows, shape=shape, nominal_ops=nominal_ops,
                  wall_seconds=wall_total, cuda_event_seconds=event_total,
                  primary_timing="host wall clock around enqueue and completion",
-                 wall_dense_equivalent_tops=count * NOMINAL_OPS / wall_total / 1e12,
-                 cuda_event_dense_equivalent_tops=count * NOMINAL_OPS / event_total / 1e12,
-                 end_to_end_dense_equivalent_tops=count * NOMINAL_OPS / elapsed / 1e12,
+                 wall_dense_equivalent_tops=count * nominal_ops / wall_total / 1e12,
+                 cuda_event_dense_equivalent_tops=count * nominal_ops / event_total / 1e12,
+                 end_to_end_dense_equivalent_tops=count * nominal_ops / elapsed / 1e12,
                  cuda_event_note="DLA event timing is auxiliary; use wall timing for DLA",
                  excluded="build, warmup, H2D, D2H, numerical checks and JSON logging excluded from summed timing windows",
                  reference="row-normalized weights preserve constant input 64/127 (raw INT8 value 64)",
@@ -357,6 +369,8 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", choices=("all", "gpu", "dla0", "dla1"), default="all")
     parser.add_argument("--seconds", type=int, default=10)
+    parser.add_argument("--spatial", type=int, choices=(32, 64), default=32,
+                        help="square spatial extent; 64 requires --target gpu")
     parser.add_argument("--window-iterations", type=int, default=100)
     parser.add_argument("--sparse", action="store_true", help="request 2:4 weight tactics; requires --target gpu")
     args = parser.parse_args(argv)
@@ -366,6 +380,8 @@ def parse_args(argv=None):
         parser.error("--window-iterations must be between 1 and 100")
     if args.sparse and args.target != "gpu":
         parser.error("--sparse requires --target gpu")
+    if args.spatial == 64 and args.target != "gpu":
+        parser.error("--spatial 64 requires --target gpu")
     return args
 
 
@@ -374,7 +390,7 @@ def main():
     try:
         for target in ("gpu", "dla0", "dla1"):
             if args.target in ("all", target):
-                benchmark(target, args.seconds, args.sparse, args.window_iterations)
+                benchmark(target, args.seconds, args.sparse, args.window_iterations, args.spatial)
     except Exception as error:
         emit(kind="error", result="FAIL", reason=str(error))
         raise SystemExit(1)
