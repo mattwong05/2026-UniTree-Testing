@@ -1,37 +1,45 @@
 # 吊装状态下的底层逐轴检查
 
-本工具适用于本次 G1 29 轴设备的调试模式。使用 `rt/lowcmd`，与 `upper_body_check.py` 的 `rt/arm_sdk` 路线不同。机器人必须稳固吊装、活动范围无人接触，现场操作员持有已在此底层模式验证有效的停止手段。
+本工具适用于 G1 29 轴、反馈 `mode_machine=5 / mode_pr=0` 的调试模式。使用 `rt/lowcmd`，与 `upper_body_check.py` 的 `rt/arm_sdk` 路线不同。机器人必须稳固吊装、活动范围无人接触，现场操作员持有已在此底层模式验证有效的停止手段。换机操作与可复制命令见 [命令行复用指南](g1-cli-reuse.md)。软件兼容条件不等于另一台机器人已验收。
 
 ## 控制范围
 
 `scripts/lowlevel_joint_check.py` 默认每次只使能一个指定关节，其他 28 个实际关节及协议空槽均明确设为 `mode=0`，不提供姿态保持力矩。默认仅预检；只有 `--execute` 才创建运动命令发布器。
 
-可选 `--hold-left-shoulder` 仅用于左肘，会额外使能左肩 Pitch/Roll/Yaw（15/16/17），把三轴目标固定在预检时的实际角度，使用 Kp/Kd=40/1、估算力矩停止线 4 Nm。此时共有 4 轴使能，其余 25 个实际关节仍禁用，不能称为只有一个电机使能。三轴目标不会追随实时反馈漂移；它们同样必须在 500 ms 内反馈使能，位移/跟随偏差不超过 0.05 rad，温度、速度和退出保护保持有效。该方案用于评估肩部保持能否减少自由随动，不能承诺不会发生其他关节位移。
+可选 `--hold-shoulder` 仅用于肘部，会额外使能同侧肩 Pitch/Roll/Yaw：左侧 15/16/17，右侧 22/23/24。三轴目标固定在预检时的实际角度，使用 Kp/Kd=40/1、估算力矩停止线 4 Nm。此时共有 4 轴使能，其余 25 个实际关节仍禁用，不能称为只有一个电机使能。三轴目标不会追随实时反馈漂移；它们同样必须在 500 ms 内反馈使能，位移/跟随偏差不超过 0.05 rad，温度、速度和退出保护保持有效。`--hold-left-shoulder` 保留为仅适用于左肘的旧写法。右侧保持目前通过软件模拟，尚未在本机主动测试。
 
 | 关节名称 | 索引 | Kp / Kd | 估算力矩停止线 |
 | --- | --- | --- | --- |
 | `left_elbow` / `right_elbow` | 18 / 25 | 40 / 1 | 4 Nm |
 | `left_shoulder_pitch` / `right_shoulder_pitch` | 15 / 22 | 40 / 1 | 4 Nm |
+| `left_shoulder_roll` / `right_shoulder_roll` | 16 / 23 | 40 / 1 | 4 Nm |
+| `left_shoulder_yaw` / `right_shoulder_yaw` | 17 / 24 | 40 / 1 | 4 Nm |
+| `left_hip_pitch` / `right_hip_pitch` | 0 / 6 | 60 / 1 | 6 Nm |
+| `left_hip_roll` / `right_hip_roll` | 1 / 7 | 60 / 1 | 6 Nm |
+| `left_hip_yaw` / `right_hip_yaw` | 2 / 8 | 60 / 1 | 6 Nm |
 | `left_knee` / `right_knee` | 3 / 9 | 100 / 2 | 6 Nm |
 
 增益及命令字段参考[官方 G1 底层示例](https://github.com/unitreerobotics/unitree_sdk2_python/blob/master/example/g1/low_level/g1_low_level_example.py)。范围参考[官方 29 轴 URDF](https://github.com/unitreerobotics/unitree_ros/blob/master/robots/g1_description/g1_29dof.urdf)。这些不代替实物配置、碰撞检查或额定负载数据。
 
 默认偏移 +1°，通常允许正负 0.25–2°。从实测角度开始保持 1 秒，3 秒移动到目标、保持 1 秒、3 秒返回、保持 1 秒，再发送全槽禁用命令。默认目标最大速度 0.5°/秒。`--hold-only` 则只保持原位 3 秒后禁用。
 
-用户在两次 +1° 后明确要求左肘做 15° 可视动作，因此仅 `left_elbow` 允许最大正负 15°，其余轴仍限制为 2°。较大角度自动延长平滑轨迹，最高目标速度为 1°/秒，返回后保持 3 秒；15° 总时长约 50 秒。增益、估算力矩停止线、跟随误差及其他关节移动限制均保持不变。单轴方案在左肘约 +5.44° 时因未使能左肩随动越限中止；后续肩部保持方案完整执行约 50 秒，反馈增量约 13.65°，但回位偏差约 0.96° 超过判定线。详见 [实测报告](../reports/lowlevel-joints-2026-09-20.md)。
+根据用户追加要求，左右肘现在允许最大正负 60°，其余主要关节仍限正负 2°；同时必须满足绝对参考限位的 5° 裕量。`--speed-deg-s` 范围为 0.25–5，默认 1，表示平滑目标轨迹的速度上限。单程时长为 `max(3 秒, 1.5 × 角度绝对值 ÷ 速度上限)`，小行程未必能达到设置速度。大于 2° 时，返回后保持 3 秒；60°、5°/秒的完整计划约 41 秒。目标速度上限不是实物绝对速度保证，全身实际速度超过 0.3 rad/s 的停止线仍不变。
+
+单轴 15° 在约 +5.44° 时因未使能左肩随动越限中止；肩部保持的 15° / 1°/秒方案完成约 50 秒，反馈增量约 13.65°、现场确认往返无异常，但回位偏差约 0.96° 超线。**后续反向 60° / 5°/秒实测在约 -6.12° 时触发左肘瞬时速度保护，未完成 60°；当前不要仅为完成行程而继续加速、提高增益或放宽停止线。** 详见 [实测报告](../reports/lowlevel-joints-2026-09-20.md)。
 
 ## 控制权与前置检查
 
 调试模式下 `MotionSwitcher.CheckMode()` 仍可能显示 `name=ai`。官方底层示例会释放该运控程序；本轮在确认 29 轴均已禁用后，只调用一次 `ReleaseMode()`，随后另行确认 `name` 为空。机上 SDK 的返回值是 `(0, None)`，不能将整个元组与整数 0 比较来判断失败，也不能因此重复发送释放请求。
 
-逐轴脚本本身不会释放或启动运控。它要求：
+普通预检及 `--execute` 不会释放或启动运控。显式的独立操作 `--release-motion` 在全身禁用、稳定、无错误、CRC/控制流检查通过后最多调用一次释放，并另行查询确认；它不能与 `--execute` 合用，不发布动作命令，也不启动运控。所有执行/释放均要求 `--expect-device-id` 与当前开发板标识匹配。它要求：
 
-- 控制管理器查询成功且运控名称为空；原有姿态服务为 IDLE。
+- 控制管理器查询成功且普通测试时运控名称为空。
+- 如果本站 `127.0.0.1:8080/status` 姿态服务存在，须为 IDLE；仅连接被明确拒绝时视为未安装该服务，超时/响应错误/非 IDLE 仍阻止启动。启用前再次检查服务状态不能变化。
 - `mode_machine=5 / mode_pr=0`，29 轴初始均为 mode=0、无错误、温度低于 60°C。
 - CRC 正确、状态不超过 100 ms、遥控没有按键、全部关节稳定。
 - 启动前没有观察到其他 `rt/lowcmd` 或 `rt/arm_sdk` 命令。
 
-执行过程中，任何遥控按键会触发本程序中止；这只是软件保护，不能替代现场独立停止。全身速度超过 0.3 rad/s、未测轴移动超过 0.05 rad、目标轴相对起点移动超过 `max(0.08 rad, 指令偏移绝对值 + 0.05 rad)`、目标跟随偏差超过 0.05 rad、超过估算力矩限制或控制循环延迟超过 50 ms 都会中止。目标轴须在 500 ms 内反馈 mode=1，其余轴必须持续为 mode=0。收到其他上身控制器命令也会中止。
+执行过程中，任何遥控按键会触发本程序中止；这只是软件保护，不能替代现场独立停止。全身速度超过 0.3 rad/s、非轨迹轴移动超过 0.05 rad、目标轴相对起点移动超过 `max(0.08 rad, 指令偏移绝对值 + 0.05 rad)`、目标跟随偏差超过 0.05 rad、超过估算力矩限制或控制循环延迟超过 50 ms 都会中止。目标轴及显式选择的保持轴须在 500 ms 内反馈 mode=1，其余轴必须持续为 mode=0。收到其他上身控制器命令也会中止。
 
 文件锁只防止本工具多开；启动时的无其他命令检查不能保证后续没有其他底层程序抢写。现场不得同时运行其他 SDK、姿态动作或自动恢复运控的程序。
 
@@ -43,13 +51,16 @@
 scp scripts/lowlevel_joint_check.py unitree@192.168.123.164:/tmp/g1-acceptance-01a0bdf8/
 ssh unitree@192.168.123.164
 cd /tmp/g1-acceptance-01a0bdf8
+python3 lowlevel_joint_check.py --device-id
+# 核对当前开发板后，将上一步输出复制到此变量；换机必须重新核对。
+G1_DEVICE_ID='粘贴当前开发板标识'
 
 # 只读预检
 python3 lowlevel_joint_check.py --joint left_elbow --hold-only
 
 # 以下会实际使能一个电机
-python3 lowlevel_joint_check.py --joint left_elbow --hold-only --execute
-python3 lowlevel_joint_check.py --joint left_elbow --delta-deg 1 --execute
+python3 lowlevel_joint_check.py --joint left_elbow --hold-only --expect-device-id "$G1_DEVICE_ID" --execute
+python3 lowlevel_joint_check.py --joint left_elbow --delta-deg 1 --expect-device-id "$G1_DEVICE_ID" --execute
 ```
 
 一次执行退出后再评估是否进入下一轴，不提供自动扫全身或失败重试功能。不要在未吊装时运行，也不要让另一人扶着正在使能的肢体“辅助通过”。
@@ -57,9 +68,9 @@ python3 lowlevel_joint_check.py --joint left_elbow --delta-deg 1 --execute
 可选的左肩保持方案应先预检、再做 3 秒原位保持；只有保持与禁用检查完成且现场无异常，才进入慢速肘部往返：
 
 ```sh
-python3 lowlevel_joint_check.py --joint left_elbow --hold-left-shoulder --delta-deg 15
-python3 lowlevel_joint_check.py --joint left_elbow --hold-left-shoulder --hold-only --execute
-python3 lowlevel_joint_check.py --joint left_elbow --hold-left-shoulder --delta-deg 15 --execute
+python3 lowlevel_joint_check.py --joint left_elbow --hold-shoulder --delta-deg 15
+python3 lowlevel_joint_check.py --joint left_elbow --hold-shoulder --hold-only --expect-device-id "$G1_DEVICE_ID" --execute
+python3 lowlevel_joint_check.py --joint left_elbow --hold-shoulder --delta-deg 15 --speed-deg-s 1 --expect-device-id "$G1_DEVICE_ID" --execute
 ```
 
 最后一条计划约 50 秒、最高目标速度 1°/秒。手动辨识之后必须先让人员离开活动范围，不能在有人扶着手臂时开始保持或运动。
