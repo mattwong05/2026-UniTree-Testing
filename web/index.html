@@ -1,0 +1,706 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="request-token" content="{{REQUEST_TOKEN}}">
+  <meta name="color-scheme" content="dark">
+  <title>G1 传感器检查 · 相机与点云</title>
+  <style>
+    :root { color-scheme: dark; --bg: #101418; --panel: #171d23; --line: #2a333c; --text: #edf2f5; --muted: #8f9ca8; --green: #8bdbc1; --amber: #e7bb72; --red: #f29a96; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; line-height: 1.6; }
+    button { font: inherit; }
+    button, a { -webkit-tap-highlight-color: transparent; }
+    button { cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: .38; }
+    button:focus-visible, a:focus-visible { outline: 2px solid var(--green); outline-offset: 4px; }
+    [hidden] { display: none !important; }
+    .shell { width: min(1440px, calc(100% - 72px)); margin: 0 auto; }
+    .topbar { border-bottom: 1px solid var(--line); }
+    .topbar-inner { min-height: 91px; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+    .brand { display: flex; align-items: center; gap: 16px; }
+    .brand-mark { width: 42px; height: 42px; border: 1px solid #52655f; display: grid; place-items: center; color: var(--green); border-radius: 12px; }
+    .brand-mark svg { width: 23px; height: 23px; }
+    h1 { font-size: 19px; line-height: 1.3; font-weight: 650; letter-spacing: .04em; margin: 0; }
+    .brand-sub { color: var(--muted); font-size: 11px; letter-spacing: .14em; margin-top: 5px; }
+    .status-badge { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 550; white-space: nowrap; color: var(--muted); }
+    .status-badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: 0 0 auto; }
+    [data-tone="live"] { color: var(--green); }
+    [data-tone="waiting"], [data-tone="stale"] { color: var(--amber); }
+    [data-tone="error"] { color: var(--red); }
+    .workspace { padding-top: 34px; padding-bottom: 28px; }
+    .intro { display: flex; justify-content: space-between; align-items: flex-end; gap: 24px; margin-bottom: 25px; }
+    .eyebrow { font-family: var(--mono); font-size: 10px; letter-spacing: .16em; color: var(--green); margin-bottom: 7px; }
+    h2 { margin: 0; font-size: clamp(24px, 2.2vw, 32px); line-height: 1.4; font-weight: 550; letter-spacing: -.03em; }
+    .intro p { margin: 7px 0 0; color: var(--muted); font-size: 13px; }
+    .controls { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+    .btn { min-height: 41px; border-radius: 7px; padding: 9px 16px; border: 1px solid #39434b; background: #202830; color: var(--text); display: inline-flex; gap: 8px; align-items: center; justify-content: center; transition: background .15s, border-color .15s; font-size: 13px; font-weight: 550; }
+    .btn:hover:not(:disabled) { background: #2b363f; border-color: #677982; }
+    .btn-primary { background: var(--green); border-color: var(--green); color: #142a23; }
+    .btn-primary:hover:not(:disabled) { background: #a0e7ce; border-color: #a0e7ce; }
+    .btn svg { width: 15px; height: 15px; }
+    .info-strip { display: grid; grid-template-columns: 1fr 1fr 1fr auto; align-items: center; border: 1px solid var(--line); border-radius: 9px; padding: 14px 19px; margin-bottom: 24px; background: #141a1f; gap: 20px; }
+    .info-label { color: var(--muted); font-size: 10px; letter-spacing: .06em; margin-bottom: 3px; }
+    .info-value { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+    .info-value.camera { font-family: inherit; }
+    .session { text-align: right; }
+    .notice { margin-bottom: 20px; border: 1px solid #735346; background: #28201e; color: #f0c8b4; border-radius: 8px; padding: 12px 16px; font-size: 13px; overflow-wrap: anywhere; white-space: pre-line; }
+    .notice[data-tone="info"] { border-color: #375249; background: #1a2924; color: #b4d8cb; }
+    .feeds { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 22px; }
+    .feed { min-width: 0; border: 1px solid var(--line); border-radius: 11px; overflow: hidden; background: var(--panel); }
+    .feed-head { padding: 17px 19px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .feed-title { display: flex; align-items: baseline; gap: 10px; }
+    .feed-title h3 { margin: 0; font-weight: 550; font-size: 15px; }
+    .feed-number { color: #6f7e89; font: 11px var(--mono); }
+    .viewport { aspect-ratio: 4 / 3; position: relative; overflow: hidden; background: #0b0f13; border-block: 1px solid #242d35; }
+    .viewport > img { width: 100%; height: 100%; object-fit: contain; display: block; visibility: hidden; }
+    .viewport.has-frame > img { visibility: visible; }
+    .overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; text-align: center; background: #0b0f13; }
+    .viewport.has-frame .overlay { background: rgba(9, 13, 17, .82); backdrop-filter: blur(3px); }
+    .overlay-icon { width: 46px; height: 46px; border: 1px solid #34434d; border-radius: 50%; display: grid; place-items: center; color: #81929e; margin-bottom: 15px; }
+    .overlay-icon svg { width: 21px; height: 21px; }
+    .overlay strong { font-size: 14px; font-weight: 550; color: #becad3; }
+    .overlay p { max-width: 320px; color: #71818e; font-size: 12px; margin: 6px 0 0; overflow-wrap: anywhere; }
+    .viewport-tag { position: absolute; top: 13px; left: 13px; background: rgba(8, 13, 17, .76); border: 1px solid #34434c; border-radius: 4px; padding: 3px 7px; font: 10px var(--mono); color: #a3b1bc; pointer-events: none; }
+    .feed-caption { padding: 11px 18px; min-height: 49px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 5px 12px; color: #a8b5be; font-size: 11px; border-bottom: 1px solid var(--line); }
+    .legend { display: flex; align-items: center; gap: 6px; font-size: 10px; color: var(--muted); }
+    .gradient { height: 5px; width: 66px; border-radius: 2px; background: linear-gradient(90deg, #244cff, #00b4ff, #31d885, #ffe34b, #f23236); }
+    .black-dot { width: 7px; height: 7px; background: #030506; border: 1px solid #505d65; margin-left: 4px; }
+    .metrics { display: grid; grid-template-columns: .85fr 1.25fr 1fr .85fr; padding: 16px 19px; gap: 7px; }
+    .metric dt { color: var(--muted); font-size: 10px; margin-bottom: 6px; }
+    .metric dd { font: 15px var(--mono); margin: 0; white-space: nowrap; color: #dfe7ec; }
+    .metric dd .unit { font-size: 10px; color: #8c9ba5; margin-left: 4px; }
+    .metric { margin: 0; }
+    .feed-bottom { padding: 0 18px 15px; display: flex; justify-content: space-between; gap: 12px; align-items: center; min-height: 44px; }
+    .frame-detail { font-size: 11px; color: #7f8e99; }
+    .btn-text { border: 0; padding: 5px 0; background: none; color: #afc4ce; font-size: 11px; display: flex; gap: 6px; align-items: center; white-space: nowrap; }
+    .btn-text svg { width: 13px; height: 13px; }
+    .btn-text:hover:not(:disabled) { color: var(--green); }
+    .footer { margin-top: 22px; display: flex; justify-content: space-between; gap: 24px; align-items: flex-start; }
+    .footer p { margin: 0; max-width: 740px; color: var(--muted); font-size: 11px; line-height: 1.85; }
+    .footer strong { color: #b5c1c9; font-weight: 500; }
+    .export { flex-shrink: 0; font-size: 12px; color: #a9c1cb; margin-top: 1px; }
+    .start-note { padding: 0 1px; margin: -10px 0 22px; color: #9aabae; font-size: 12px; }
+    .lidar-feed { grid-column: 1 / -1; }
+    .lidar-tools { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .lidar-tools label { color: var(--muted); font-size: 11px; }
+    .lidar-tools select { background: #11181e; border: 1px solid #39434b; color: #c8d6de; border-radius: 5px; padding: 5px 8px; font: inherit; font-size: 11px; }
+    .lidar-tools .btn { font-size: 11px; min-height: 30px; padding: 4px 10px; }
+    .lidar-viewport { height: clamp(300px, 37vw, 490px); aspect-ratio: auto !important; }
+    #lidar-canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+    #lidar-canvas:active { cursor: grabbing; }
+    #lidar-canvas:focus-visible { outline: 2px solid var(--green); outline-offset: -3px; }
+    .lidar-viewport .overlay { pointer-events: none; }
+    .lidar-hint { position: absolute; right: 14px; bottom: 12px; padding: 4px 8px; background: #0b0f13d9; border-radius: 4px; color: #7e939f; font-size: 10px; pointer-events: none; }
+    .lidar-metrics { grid-template-columns: repeat(5, minmax(0, 1fr)) minmax(150px, 1.4fr); gap: 16px; }
+    .lidar-metrics .frame-id { font-size: 12px; white-space: normal; overflow-wrap: anywhere; }
+    .lidar-warning { padding: 9px 18px; color: var(--amber); background: #28241c; border-bottom: 1px solid #443b2b; font-size: 11px; overflow-wrap: anywhere; }
+    .lidar-bottom { flex-wrap: wrap; }
+    .axis-x { color: #ec8a83; } .axis-y { color: #80cfa6; } .axis-z { color: #80b9f2; }
+    .footline { margin-top: 35px; padding-top: 13px; border-top: 1px solid var(--line); display: flex; justify-content: space-between; gap: 15px; color: #667781; font: 10px var(--mono); letter-spacing: .04em; }
+    @media (min-width: 1600px) { .viewport { aspect-ratio: 16 / 11; } }
+    @media (max-width: 980px) { .shell { width: calc(100% - 40px); } .feeds { gap: 16px; } .info-strip { grid-template-columns: 1fr 1fr; gap: 12px 20px; } .session { text-align: left; } .metrics { padding: 15px 13px; gap: 5px; } .metric dd { font-size: 12px; } .feed-head { padding: 14px; } .feed-title { gap: 6px; } }
+    @media (max-width: 680px) { .shell { width: calc(100% - 28px); } .topbar-inner { min-height: 78px; gap: 10px; } .brand { gap: 10px; } .brand-mark { width: 35px; height: 35px; border-radius: 10px; } h1 { font-size: 16px; } .brand-sub { font-size: 9px; letter-spacing: .1em; } .workspace { padding-top: 25px; } .intro { align-items: flex-start; flex-direction: column; gap: 18px; margin-bottom: 20px; } .controls { width: 100%; } .btn-primary { flex: 1; } .info-strip { padding: 13px 15px; margin-bottom: 18px; } .feeds { grid-template-columns: 1fr; gap: 19px; } .metrics { padding: 16px 18px; } .metric dd { font-size: 14px; } .footer { flex-direction: column; gap: 13px; } .footline { margin-top: 25px; flex-wrap: wrap; } }
+    @media (max-width: 800px) { .lidar-feed .feed-head { align-items: flex-start; flex-wrap: wrap; } .lidar-tools { width: 100%; justify-content: flex-end; } .lidar-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); row-gap: 18px; } .lidar-hint { left: 12px; right: auto; } }
+    @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="shell topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5"/><circle cx="12" cy="12" r="4"/><path d="M12 7v2m0 6v2M7 12h2m6 0h2"/></svg></span>
+        <div><h1>G1 传感器检查</h1><div class="brand-sub">SENSOR INSPECTION / 实时感知</div></div>
+      </div>
+      <span id="connection-status" class="status-badge" role="status">未连接</span>
+    </div>
+  </header>
+  <main class="shell workspace">
+    <div class="intro">
+      <div><div class="eyebrow">LIVE VIEW · CAMERA + LIDAR</div><h2>从画面，确认此刻。</h2><p>同时查看彩色图像、原始深度与雷达点云，检查数据是否连续更新。</p></div>
+      <div class="controls">
+        <button id="start-button" class="btn btn-primary" type="button"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M6 3l6 5-6 5V3Z"/></svg><span>连接预览</span></button>
+        <button id="stop-button" class="btn" type="button" disabled><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1"/></svg>停止</button>
+      </div>
+    </div>
+    <p id="stop-progress" class="start-note" role="status" hidden>正在停止并确认雷达驱动状态，可能需要约 20 秒。</p>
+    <p class="start-note">连接预览会临时开启雷达驱动；停止时恢复原状态。这里只采集传感器数据，不启动导航或运动。</p>
+    <div class="info-strip" aria-label="设备与会话信息">
+      <div><div class="info-label">设备地址</div><div id="robot-host" class="info-value">{{ROBOT_HOST}}</div></div>
+      <div><div class="info-label">相机</div><div id="camera-name" class="info-value camera">等待读取</div></div>
+      <div><div class="info-label">设备序列号</div><div id="camera-serial" class="info-value">—</div></div>
+      <div class="session"><div class="info-label">本次预览剩余</div><div id="session-time" class="info-value">最长 15 分钟</div></div>
+    </div>
+    <div id="notice" class="notice" role="alert" hidden></div>
+    <section class="feeds" aria-label="实时图像">
+      <article class="feed" aria-labelledby="rgb-title">
+        <div class="feed-head"><div class="feed-title"><span class="feed-number">01</span><h3 id="rgb-title">彩色图像</h3></div><span id="rgb-state" class="status-badge">未连接</span></div>
+        <div id="rgb-viewport" class="viewport">
+          <img id="rgb-image" alt="设备当前彩色画面">
+          <div id="rgb-overlay" class="overlay"><span class="overlay-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3" y="6" width="18" height="13" rx="3"/><path d="m8 6 2-3h4l2 3"/><circle cx="12" cy="12.5" r="3"/></svg></span><strong id="rgb-overlay-title">等待连接</strong><p id="rgb-overlay-detail">点击「连接预览」后显示设备的实时画面。</p></div>
+          <span class="viewport-tag" aria-hidden="true">RGB</span>
+        </div>
+        <div class="feed-caption"><span>实时彩色 · 原始画面比例</span><span>RGB CAMERA</span></div>
+        <div class="metrics" aria-label="彩色图像统计">
+          <dl class="metric"><dt>帧率</dt><dd><span id="rgb-fps">—</span><span class="unit">FPS</span></dd></dl>
+          <dl class="metric"><dt>分辨率</dt><dd id="rgb-size">—</dd></dl>
+          <dl class="metric"><dt>帧龄</dt><dd id="rgb-age">—</dd></dl>
+          <dl class="metric"><dt>接收帧数</dt><dd id="rgb-frames">—</dd></dl>
+        </div>
+        <div class="feed-bottom"><span id="rgb-detail" class="frame-detail">尚未开始采集</span><button class="btn-text" id="rgb-save" type="button" disabled><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="M8 2v8m-3-3 3 3 3-3M3 11v3h10v-3"/></svg>保存当前帧</button></div>
+      </article>
+      <article class="feed" aria-labelledby="depth-title">
+        <div class="feed-head"><div class="feed-title"><span class="feed-number">02</span><h3 id="depth-title">深度图像</h3></div><span id="depth-state" class="status-badge">未连接</span></div>
+        <div id="depth-viewport" class="viewport">
+          <img id="depth-image" alt="设备当前深度伪彩色画面，近蓝远红，黑色无数据">
+          <div id="depth-overlay" class="overlay"><span class="overlay-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="m12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5"/></svg></span><strong id="depth-overlay-title">等待连接</strong><p id="depth-overlay-detail">连接后显示深度伪彩色；黑色区域表示无数据。</p></div>
+          <span class="viewport-tag" aria-hidden="true">DEPTH</span>
+        </div>
+        <div class="feed-caption"><span>原始深度 · 未标定距离</span><span class="legend"><span>近</span><span class="gradient" aria-label="近蓝远红"></span><span>远</span><span class="black-dot" aria-hidden="true"></span><span>无数据</span></span></div>
+        <div class="metrics" aria-label="深度图像统计">
+          <dl class="metric"><dt>帧率</dt><dd><span id="depth-fps">—</span><span class="unit">FPS</span></dd></dl>
+          <dl class="metric"><dt>分辨率</dt><dd id="depth-size">—</dd></dl>
+          <dl class="metric"><dt>帧龄</dt><dd id="depth-age">—</dd></dl>
+          <dl class="metric"><dt>接收帧数</dt><dd id="depth-frames">—</dd></dl>
+        </div>
+        <div class="feed-bottom"><span id="depth-detail" class="frame-detail">尚未开始采集</span><button class="btn-text" id="depth-save" type="button" disabled><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="M8 2v8m-3-3 3 3 3-3M3 11v3h10v-3"/></svg>保存当前帧</button></div>
+      </article>
+      <article class="feed lidar-feed" aria-labelledby="lidar-title">
+        <div class="feed-head">
+          <div class="feed-title"><span class="feed-number">03</span><h3 id="lidar-title">雷达实时点云</h3></div>
+          <div class="lidar-tools"><span id="lidar-state" class="status-badge">未连接</span><label for="lidar-color">着色</label><select id="lidar-color"><option value="distance">按距离</option><option value="height">按高度 Z</option></select><button id="lidar-reset" class="btn" type="button">复位视角</button></div>
+        </div>
+        <div id="lidar-viewport" class="viewport lidar-viewport">
+          <canvas id="lidar-canvas" tabindex="0" role="img" aria-label="实时雷达三维点云。拖动或方向键旋转，滚轮或加减键缩放，Home 键复位。">浏览器不支持点云画布，请使用较新的浏览器。</canvas>
+          <div id="lidar-overlay" class="overlay"><span class="overlay-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><path d="m12 3 8 5v9l-8 4-8-4V8l8-5Zm0 9v9M4 8l8 4 8-4"/><circle cx="12" cy="12" r="2"/></svg></span><strong id="lidar-overlay-title">等待连接</strong><p id="lidar-overlay-detail">连接后显示雷达实际采集的点云，不显示模拟场景。</p></div>
+          <span class="viewport-tag" aria-hidden="true">LIDAR / 3D</span><span class="lidar-hint">拖动旋转 · 滚轮缩放 · 网格间距 1 m</span>
+        </div>
+        <div class="feed-caption"><span>雷达坐标系 · Z = 0 参考网格，非实测地面</span><span class="legend"><span id="lidar-color-low">0 m</span><span class="gradient" aria-hidden="true"></span><span id="lidar-color-high">10 m 及以上</span><span class="axis-x">X</span><span class="axis-y">Y</span><span class="axis-z">Z</span></span></div>
+        <div id="lidar-warning" class="lidar-warning" role="status">HMS 未检查 · 等待当前雷达告警信息。</div>
+        <div class="feed-caption"><span id="lidar-identity">雷达身份：等待读取</span><span id="lidar-diagnostic-time">诊断时间：未报告</span></div>
+        <div class="metrics lidar-metrics" aria-label="雷达点云统计">
+          <dl class="metric"><dt>实际采集帧率</dt><dd><span id="lidar-fps">—</span><span class="unit">Hz</span></dd></dl>
+          <dl class="metric"><dt>原始点数 / 帧</dt><dd id="lidar-points">—</dd></dl>
+          <dl class="metric"><dt>显示抽样点数</dt><dd id="lidar-display-points">—</dd></dl>
+          <dl class="metric"><dt>点云帧龄</dt><dd id="lidar-age">—</dd></dl>
+          <dl class="metric"><dt>已接收帧数</dt><dd id="lidar-frames">—</dd></dl>
+          <dl class="metric"><dt>坐标系 frame_id</dt><dd id="lidar-frame-id" class="frame-id">—</dd></dl>
+        </div>
+        <div class="feed-bottom lidar-bottom"><span id="lidar-service" class="frame-detail">雷达驱动状态：等待读取</span><span class="frame-detail">网页最多刷新 5 次 / 秒；下载包含显示抽样点。</span><button id="lidar-save" class="btn-text" type="button" disabled><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="M8 2v8m-3-3 3 3 3-3M3 11v3h10v-3"/></svg>保存点云 JSON</button></div>
+      </article>
+    </section>
+    <div class="footer">
+      <p><strong>本页用于检查实时数据，不自动给出验收结论。</strong>深度颜色只用于观察层次，不能作为精确距离读数。点云保留雷达坐标，未与相机画面对齐。超过 3 秒未更新的数据会标为过期；所有预览页面关闭且 30 秒无心跳后自动停止，雷达驱动恢复还需数秒。</p>
+      <button id="export-button" class="btn-text export" type="button" disabled><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="M8 2v8m-3-3 3 3 3-3M3 11v3h10v-3"/></svg>下载检查摘要 <span aria-hidden="true">↗</span></button>
+    </div>
+    <div class="footline"><span>G1 / SENSOR WORKSPACE</span><span id="sample-time">尚未读取状态</span></div>
+  </main>
+  <script>
+    'use strict';
+    (() => {
+      const token = document.querySelector('meta[name="request-token"]').content;
+      const $ = id => document.getElementById(id);
+      const channels = ['rgb', 'depth'];
+      let latest = null;
+      let statusAt = 0;
+      let sampledAt = null;
+      let statusError = '';
+      let wanted = false;
+      let wasStopped = false;
+      let busy = false;
+      let streamSequence = 0;
+      let observedSessionId = null;
+      let heartbeatBusy = false;
+      let statusRequest = 0;
+      let noticeText = '';
+      const streamErrors = {rgb: false, depth: false};
+      const retryAt = {rgb: 0, depth: 0};
+      let lidarFrame = null;
+      let lidarAt = 0;
+      let lidarError = '';
+      let lidarEpoch = 0;
+      let lidarRequest = null;
+      let lidarDrawing = false;
+      const canvas = $('lidar-canvas');
+      const context = canvas.getContext('2d');
+      const view = {yaw: -0.75, pitch: 0.6, distance: 14};
+      const palette = Array.from({length: 128}, (_, index) => `hsl(${220 * (1 - index / 127)}, 83%, 65%)`);
+      let drag = null;
+
+      function showNotice(message, tone = 'error') {
+        noticeText = message;
+        $('notice').textContent = message;
+        $('notice').dataset.tone = tone;
+        $('notice').hidden = !message;
+      }
+
+      async function request(path, options = {}) {
+        const controller = new AbortController();
+        const cancel = () => controller.abort();
+        options.signal?.addEventListener('abort', cancel, {once: true});
+        if (options.signal?.aborted) controller.abort();
+        const timer = setTimeout(cancel, options.method === 'POST' ? 35000 : 8000);
+        try {
+          const response = await fetch(path, {cache: 'no-store', credentials: 'same-origin', ...options, signal: controller.signal});
+          if (!response.ok) {
+            let detail = '';
+            try {
+              const body = await response.json();
+              detail = [body.cleanup_error, body.last_error, body.error, body.message].find(value => typeof value === 'string' && value) || '';
+            } catch (_) { /* The response may have no JSON body. */ }
+            const error = new Error(detail || `请求未完成（${response.status}）`);
+            error.status = response.status;
+            throw error;
+          }
+          // Keep timeout and stop cancellation active until the whole body arrives.
+          // MJPEG streams use <img> directly and do not pass through this helper.
+          return new Response(await response.arrayBuffer(), {status: response.status, headers: response.headers});
+        } finally { clearTimeout(timer); options.signal?.removeEventListener('abort', cancel); }
+      }
+
+      const post = path => request(path, {method: 'POST', headers: {'X-Request-Token': token}});
+      const safeNumber = value => typeof value === 'number' && Number.isFinite(value);
+      const ageOf = item => item && safeNumber(item.age_ms) ? Math.max(0, item.age_ms + performance.now() - statusAt) : null;
+      const readableError = error => error.name === 'AbortError' ? '设备响应超时，请检查网络连接。' : error.message || '暂时无法连接到设备。';
+      const statusFresh = () => !statusError && statusAt > 0 && performance.now() - statusAt < 3500;
+      const lidarAge = () => lidarFrame && safeNumber(lidarFrame.age_ms) ? Math.max(0, lidarFrame.age_ms + performance.now() - lidarAt) : null;
+      const sameLidarSession = frame => frame.session_id === (latest?.session?.id ?? null);
+      const lidarFresh = () => Boolean(wanted && latest?.running && statusFresh() && !lidarError && lidarFrame && lidarFrame.points.length > 0 && sameLidarSession(lidarFrame) && lidarAge() <= 3000 && latest.lidar?.state === 'live' && ageOf(latest.lidar) !== null && ageOf(latest.lidar) <= 3000);
+
+      function clearLidar() {
+        lidarEpoch++;
+        lidarRequest?.abort();
+        lidarRequest = null;
+        lidarFrame = null;
+        lidarAt = 0;
+        lidarError = '';
+        scheduleLidarDraw();
+      }
+
+      function scheduleLidarDraw() {
+        if (lidarDrawing) return;
+        lidarDrawing = true;
+        requestAnimationFrame(() => { lidarDrawing = false; drawLidar(); });
+      }
+
+      function drawLidar() {
+        if (!context) return;
+        const width = canvas.clientWidth;
+        const height = canvas.clientHeight;
+        if (!width || !height) return;
+        const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+        if (canvas.width !== Math.round(width * pixelRatio) || canvas.height !== Math.round(height * pixelRatio)) {
+          canvas.width = Math.round(width * pixelRatio);
+          canvas.height = Math.round(height * pixelRatio);
+        }
+        context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+        context.fillStyle = '#0b0f13';
+        context.fillRect(0, 0, width, height);
+        const cy = Math.cos(view.yaw), sy = Math.sin(view.yaw);
+        const cp = Math.cos(view.pitch), sp = Math.sin(view.pitch);
+        const focal = Math.min(width, height) * 1.25;
+        function project(point) {
+          const x = point[0] * cy - point[1] * sy;
+          const y = point[0] * sy + point[1] * cy;
+          const depth = view.distance - y * cp - point[2] * sp;
+          if (depth < 0.15) return null;
+          return [width / 2 + x * focal / depth, height * 0.54 - (point[2] * cp - y * sp) * focal / depth, depth];
+        }
+        function line(start, end, color, label = '') {
+          const a = project(start), b = project(end);
+          if (!a || !b) return;
+          context.strokeStyle = color;
+          context.lineWidth = label ? 1.5 : 0.7;
+          context.beginPath(); context.moveTo(a[0], a[1]); context.lineTo(b[0], b[1]); context.stroke();
+          if (label) { context.fillStyle = color; context.font = '11px ui-monospace, monospace'; context.fillText(label, b[0] + 5, b[1] - 5); }
+        }
+        for (let step = -5; step <= 5; step++) {
+          line([step, -5, 0], [step, 5, 0], '#25323a');
+          line([-5, step, 0], [5, step, 0], '#25323a');
+        }
+        line([0, 0, 0], [2, 0, 0], '#ec8a83', 'X');
+        line([0, 0, 0], [0, 2, 0], '#80cfa6', 'Y');
+        line([0, 0, 0], [0, 0, 2], '#80b9f2', 'Z');
+        if (!lidarFresh()) return;
+        const byHeight = $('lidar-color').value === 'height';
+        const projected = [];
+        for (const point of lidarFrame.points) {
+          const screen = project(point);
+          if (!screen || screen[0] < -4 || screen[0] > width + 4 || screen[1] < -4 || screen[1] > height + 4) continue;
+          const amount = byHeight ? (point[2] + 2) / 4 : Math.hypot(...point) / 10;
+          projected.push([...screen, Math.round(Math.max(0, Math.min(1, amount)) * 127)]);
+        }
+        projected.sort((a, b) => b[2] - a[2]);
+        for (const point of projected) {
+          context.fillStyle = palette[point[3]];
+          const size = Math.max(1.3, Math.min(3.2, 23 / point[2]));
+          context.fillRect(point[0] - size / 2, point[1] - size / 2, size, size);
+        }
+      }
+
+      async function pollLidar() {
+        if (!wanted || !latest?.running || !statusFresh() || lidarRequest) return;
+        const controller = new AbortController();
+        const epoch = lidarEpoch;
+        const sessionId = latest.session?.id ?? null;
+        lidarRequest = controller;
+        try {
+          const response = await request('/api/lidar', {signal: controller.signal});
+          const frame = await response.json();
+          if (epoch !== lidarEpoch || !wanted || !latest?.running || sessionId !== (latest.session?.id ?? null)) return;
+          if (!sameLidarSession(frame)) throw new Error('会话已切换，等待本次预览的点云。');
+          if (!safeNumber(frame.sequence) || !safeNumber(frame.age_ms) || !Array.isArray(frame.points) || frame.points.length > 50000 || !frame.points.every(point => Array.isArray(point) && point.length === 3 && point.every(safeNumber))) throw new Error('点云数据格式不完整，已停止显示此帧。');
+          if (frame.age_ms > 3000) throw new Error('收到的点云已过期，等待新帧。');
+          if (lidarFrame && frame.sequence <= lidarFrame.sequence) return;
+          lidarFrame = frame;
+          lidarAt = performance.now();
+          lidarError = '';
+          scheduleLidarDraw();
+        } catch (error) {
+          if (epoch !== lidarEpoch || !wanted || controller.signal.aborted) return;
+          lidarError = error.status === 409 ? '暂时没有新鲜点云，等待雷达数据。' : readableError(error);
+          lidarFrame = null;
+          lidarAt = 0;
+          scheduleLidarDraw();
+        } finally {
+          if (lidarRequest === controller) lidarRequest = null;
+          render();
+        }
+      }
+
+      function renderLidar() {
+        const active = Boolean(wanted && latest?.running);
+        const item = latest?.lidar;
+        const age = lidarAge();
+        let label = wasStopped ? '已停止' : '未连接';
+        let title = wasStopped ? '点云预览已停止' : '等待连接';
+        let detail = wasStopped ? '点云已清空。重新连接后接收新的采样。' : '连接后显示雷达实际采集的点云，不显示模拟场景。';
+        let tone = '';
+        const valid = Boolean(context && lidarFresh());
+        if (!context) { label = '不可用'; title = '浏览器不支持点云画布'; detail = '请使用支持 Canvas 的较新浏览器。'; tone = 'error'; }
+        else if (wanted && !statusFresh()) { label = '连接中断'; title = '无法确认点云更新'; detail = '已隐藏点云，请检查设备连接。'; tone = 'error'; }
+        else if (wanted && item?.state === 'error') { label = '采集异常'; title = '暂时无法获取点云'; detail = item.error || '请检查雷达服务与网络连接。'; tone = 'error'; }
+        else if (active && (item?.state === 'stale' || (age !== null && age > 3000) || (ageOf(item) !== null && ageOf(item) > 3000))) { label = '点云过期'; title = '点云已超过 3 秒未更新'; detail = '旧点云已隐藏，等待新采样。'; tone = 'stale'; }
+        else if (active && lidarError) { label = '等待新帧'; title = '暂时没有可显示的新鲜点云'; detail = lidarError; tone = 'waiting'; }
+        else if (active && lidarFrame && lidarFrame.points.length === 0) { label = '等待有效点'; title = '本帧没有有效点'; detail = '雷达已返回数据，正在等待有效的非零坐标点。'; tone = 'waiting'; }
+        else if (valid) { label = '实时'; title = ''; detail = ''; tone = 'live'; }
+        else if (wanted) { label = '等待点云'; title = '正在接收雷达点云'; detail = '驱动启动与第一帧采集可能需要几秒钟。'; tone = 'waiting'; }
+        setBadge('lidar-state', label, tone);
+        $('lidar-overlay').hidden = valid;
+        $('lidar-overlay-title').textContent = title;
+        $('lidar-overlay-detail').textContent = detail;
+        $('lidar-save').disabled = !valid;
+        const visible = active && statusFresh();
+        const receivedHz = safeNumber(item?.received_hz) ? item.received_hz : safeNumber(lidarFrame?.received_hz) ? lidarFrame.received_hz : item?.fps;
+        const receivedFrames = safeNumber(item?.received_frames) ? item.received_frames : safeNumber(lidarFrame?.received_frames) ? lidarFrame.received_frames : item?.frames;
+        $('lidar-fps').textContent = visible && safeNumber(receivedHz) ? receivedHz.toFixed(1) : '—';
+        $('lidar-points').textContent = valid && safeNumber(lidarFrame.point_count) ? lidarFrame.point_count.toLocaleString('zh-CN') : '—';
+        $('lidar-display-points').textContent = valid ? lidarFrame.points.length.toLocaleString('zh-CN') : '—';
+        $('lidar-age').textContent = visible && age !== null ? age < 1000 ? `${Math.round(age)} ms` : `${(age / 1000).toFixed(1)} s` : '—';
+        $('lidar-frames').textContent = visible && safeNumber(receivedFrames) ? receivedFrames.toLocaleString('zh-CN') : '—';
+        $('lidar-frame-id').textContent = valid ? lidarFrame.frame_id || '未报告' : '—';
+        $('lidar-warning').textContent = item?.warning || 'HMS 未检查 · 暂无当前雷达告警信息，不能据此判断无告警。';
+        const service = item?.service_state;
+        const phaseLabels = {checking: '正在核对原状态', starting: '正在开启', running: '正在采集', restoring: '正在恢复原状态', restored: '已恢复原状态', unchanged: '保持原状态', restore_unconfirmed: '恢复尚未确认'};
+        $('lidar-service').textContent = `雷达驱动：${phaseLabels[service?.phase] || '等待读取'}`;
+        $('lidar-service').dataset.tone = service?.phase === 'restore_unconfirmed' ? 'error' : '';
+        const lidarIp = item?.lidar_ip || lidarFrame?.lidar_ip;
+        const lidarSerial = item?.serial_number || lidarFrame?.serial_number;
+        $('lidar-identity').textContent = `雷达 ${lidarIp || 'IP 未报告'} · 序列号 ${lidarSerial || '未报告'}`;
+        const diagnosticAt = item?.diagnostic_at || lidarFrame?.diagnostic_at;
+        if (diagnosticAt) {
+          const time = new Date(typeof diagnosticAt === 'number' ? diagnosticAt * 1000 : diagnosticAt);
+          $('lidar-diagnostic-time').textContent = `诊断时间：${Number.isNaN(time.getTime()) ? String(diagnosticAt) : time.toLocaleString('zh-CN', {hour12: false})}`;
+        } else $('lidar-diagnostic-time').textContent = '诊断时间：未报告';
+        scheduleLidarDraw();
+      }
+
+      function removeStreams() {
+        for (const name of channels) {
+          $(name + '-image').removeAttribute('src');
+          streamErrors[name] = false;
+          $(name + '-viewport').classList.remove('has-frame');
+        }
+      }
+
+      function openStream(name) {
+        streamErrors[name] = false;
+        retryAt[name] = performance.now();
+        $(name + '-image').src = `/stream/${name}.mjpg?session=${++streamSequence}`;
+      }
+
+      function syncStreams() {
+        const sessionId = latest?.session?.id ?? null;
+        if (sessionId !== observedSessionId) {
+          removeStreams();
+          clearLidar();
+          observedSessionId = sessionId;
+        }
+        if (!wanted || !latest?.running) {
+          removeStreams();
+          if (lidarFrame || lidarRequest) clearLidar();
+          return;
+        }
+        for (const name of channels) {
+          if (!$(name + '-image').hasAttribute('src')) openStream(name);
+        }
+      }
+
+      function setBadge(id, text, tone = '') {
+        $(id).textContent = text;
+        $(id).dataset.tone = tone;
+      }
+
+      function render() {
+        const active = Boolean(wanted && latest?.running);
+        const fresh = statusFresh();
+        $('start-button').disabled = busy || active;
+        $('start-button').querySelector('span').textContent = busy ? '请稍候…' : active ? '预览中' : '连接预览';
+        $('stop-button').disabled = busy || !(wanted || latest?.running);
+        $('stop-progress').hidden = !(busy && wasStopped);
+        $('export-button').disabled = !latest || !fresh;
+        if (statusError || (statusAt && !fresh)) setBadge('connection-status', '连接中断', 'error');
+        else if (busy) setBadge('connection-status', '正在处理', 'waiting');
+        else if (active) {
+          const allLive = lidarFresh() && channels.every(name => latest[name]?.state === 'live' && ageOf(latest[name]) !== null && ageOf(latest[name]) <= 3000 && !streamErrors[name]);
+          setBadge('connection-status', allLive ? '三路实时连接' : '部分数据待更新', allLive ? 'live' : 'waiting');
+        } else setBadge('connection-status', wasStopped ? '已停止' : '未连接');
+
+        const seconds = latest?.session?.remaining_s;
+        if (active && safeNumber(seconds)) {
+          const remaining = Math.max(0, Math.ceil(seconds - (performance.now() - statusAt) / 1000));
+          $('session-time').textContent = `${String(Math.floor(remaining / 60)).padStart(2, '0')}:${String(remaining % 60).padStart(2, '0')}`;
+        } else $('session-time').textContent = wasStopped ? '会话已结束' : '最长 15 分钟';
+
+        for (const name of channels) {
+          const item = latest?.[name];
+          const age = ageOf(item);
+          const image = $(name + '-image');
+          let label = wasStopped ? '已停止' : '未连接';
+          let title = wasStopped ? '预览已停止' : '等待连接';
+          let detail = wasStopped ? '重新连接后开始新的实时预览。' : '点击「连接预览」后显示设备的实时画面。';
+          let tone = '';
+          let valid = false;
+          if (wanted && (!fresh || statusError)) {
+            label = '连接中断'; title = '暂时无法确认画面更新'; tone = 'error';
+            detail = '请检查网络连接。已遮挡旧画面，避免将其误认为实时图像。';
+          } else if (wanted && item?.state === 'error') {
+            label = '采集异常'; title = '暂时无法获取画面'; tone = 'error';
+            detail = item.error || latest?.last_error || '请检查相机连接后重新连接预览。';
+          } else if (active && (item?.state === 'stale' || (age !== null && age > 3000))) {
+            label = '画面过期'; title = '画面已超过 3 秒未更新'; tone = 'stale';
+            detail = '当前图像不能代表设备此刻的状态，等待新画面。';
+          } else if (active && streamErrors[name]) {
+            label = '传输中断'; title = '图像传输暂时中断'; tone = 'error';
+            detail = '正在尝试重新接收画面。';
+          } else if (active && item?.state === 'live' && age !== null && image.naturalWidth > 0) {
+            label = '实时'; title = ''; detail = ''; tone = 'live'; valid = true;
+          } else if (wanted) {
+            label = '等待画面'; title = '正在接收第一帧'; tone = 'waiting';
+            detail = '相机初始化可能需要几秒钟。';
+          }
+          setBadge(name + '-state', label, tone);
+          $(name + '-overlay').hidden = valid;
+          $(name + '-overlay-title').textContent = title;
+          $(name + '-overlay-detail').textContent = detail;
+          $(name + '-viewport').classList.toggle('has-frame', active && image.hasAttribute('src') && image.naturalWidth > 0);
+          $(name + '-save').disabled = !valid;
+          const visible = active && fresh;
+          $(name + '-fps').textContent = visible && safeNumber(item?.fps) ? item.fps.toFixed(1) : '—';
+          $(name + '-size').textContent = visible && item?.width > 0 && item?.height > 0 ? `${item.width} × ${item.height}` : '—';
+          $(name + '-frames').textContent = visible && safeNumber(item?.frames) ? item.frames.toLocaleString('zh-CN') : '—';
+          $(name + '-age').textContent = visible && age !== null ? age < 1000 ? `${Math.round(age)} ms` : `${(age / 1000).toFixed(1)} s` : '—';
+          $(name + '-age').style.color = visible && age > 3000 ? 'var(--amber)' : '';
+          if (name === 'depth' && visible && safeNumber(item?.nonzero_fraction)) {
+            $(name + '-detail').textContent = `非零深度像素 ${(Math.max(0, Math.min(1, item.nonzero_fraction)) * 100).toFixed(1)}%`;
+            $(name + '-detail').title = item.scale_label || '伪彩色显示原始深度层次，未标定距离';
+          } else $(name + '-detail').textContent = visible ? '统计来自设备采集' : wasStopped ? '采集已停止' : '尚未开始采集';
+          if (active && fresh && streamErrors[name] && performance.now() - retryAt[name] > 5000 && item?.state === 'live') openStream(name);
+        }
+        renderLidar();
+      }
+
+      async function refreshStatus() {
+        const requestId = ++statusRequest;
+        try {
+          const response = await request('/api/status');
+          const data = await response.json();
+          if (requestId !== statusRequest) return;
+          if (!data || typeof data.running !== 'boolean') throw new Error('收到的设备状态不完整。');
+          const hadError = Boolean(statusError);
+          latest = data;
+          statusAt = performance.now();
+          sampledAt = new Date().toISOString();
+          statusError = '';
+          if (data.robot?.host) $('robot-host').textContent = data.robot.host;
+          $('camera-name').textContent = data.robot?.camera_name || '等待读取';
+          $('camera-serial').textContent = data.robot?.serial || '—';
+          $('sample-time').textContent = `状态采样 ${new Date(sampledAt).toLocaleTimeString('zh-CN', {hour12: false})}`;
+          if (data.cleanup_error) showNotice(`雷达驱动状态恢复待确认：${data.cleanup_error}`);
+          if (wanted && !data.running && !busy) {
+            wanted = false;
+            wasStopped = true;
+            if (!data.cleanup_error) showNotice(data.last_error || '本次预览已结束。可点击「连接预览」重新开始。', data.last_error ? 'error' : 'info');
+          } else if (data.last_error && !data.cleanup_error) showNotice(data.last_error);
+          else if (!data.cleanup_error && hadError && noticeText.startsWith('状态读取失败')) showNotice('');
+          syncStreams();
+        } catch (error) {
+          if (requestId !== statusRequest) return;
+          statusError = readableError(error);
+          if (!noticeText.startsWith('雷达驱动状态恢复待确认：')) showNotice(`状态读取失败：${statusError}`);
+        }
+        render();
+      }
+
+      async function poll() {
+        await refreshStatus();
+        setTimeout(poll, 1000);
+      }
+
+      $('start-button').addEventListener('click', async () => {
+        if (busy) return;
+        busy = true;
+        wasStopped = false;
+        clearLidar();
+        showNotice('');
+        render();
+        try {
+          await post('/api/start');
+          wanted = true;
+          removeStreams();
+          await refreshStatus();
+        } catch (error) { showNotice(`无法开始预览：${readableError(error)}`); }
+        finally { busy = false; render(); }
+      });
+
+      $('stop-button').addEventListener('click', async () => {
+        if (busy) return;
+        busy = true;
+        wanted = false;
+        wasStopped = true;
+        removeStreams();
+        clearLidar();
+        render();
+        try {
+          const response = await post('/api/stop');
+          const stopped = await response.json();
+          if (stopped.cleanup_error) showNotice(`雷达驱动状态恢复待确认：${stopped.cleanup_error}`);
+          else showNotice(stopped.last_error || '');
+          await refreshStatus();
+        }
+        catch (error) { showNotice(`网页预览已关闭，设备停止状态尚未确认：${readableError(error)}`); }
+        finally { busy = false; render(); }
+      });
+
+      setInterval(async () => {
+        if (!wanted || !latest?.running || heartbeatBusy) return;
+        heartbeatBusy = true;
+        try { await post('/api/heartbeat'); }
+        catch (error) { statusError = readableError(error); showNotice(`连接保持失败：${statusError}`); render(); }
+        finally { heartbeatBusy = false; }
+      }, 5000);
+
+      function download(blob, filename) {
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+
+      const filenameTime = () => new Date().toISOString().replace(/[:.]/g, '-');
+      for (const name of channels) {
+        $(name + '-image').addEventListener('error', () => {
+          if (!wanted || !$(name + '-image').hasAttribute('src')) return;
+          streamErrors[name] = true;
+          retryAt[name] = performance.now();
+          render();
+        });
+        $(name + '-image').addEventListener('load', () => { streamErrors[name] = false; render(); });
+        $(name + '-save').addEventListener('click', async () => {
+          try {
+            const response = await request(`/api/snapshot/${name}.jpg`);
+            download(await response.blob(), `g1-${name}-${filenameTime()}.jpg`);
+            showNotice(`${name === 'rgb' ? '彩色' : '深度'}当前帧已下载。`, 'info');
+          } catch (error) {
+            const message = error.status === 404 ? '尚未收到可保存的画面，请等待第一帧。' : error.status === 409 ? '当前画面已过期或采集已停止，请在实时画面恢复后再保存。' : readableError(error);
+            showNotice(`未能保存图像：${message}`);
+          }
+        });
+      }
+
+      $('export-button').addEventListener('click', async () => {
+        try {
+          const response = await request('/api/status');
+          const status = await response.json();
+          const summary = {sampled_at: new Date().toISOString(), note: '相机与雷达实时采集状态记录，不构成设备验收结论；深度显示未标定距离。', status};
+          download(new Blob([JSON.stringify(summary, null, 2) + '\n'], {type: 'application/json'}), `g1-sensor-status-${filenameTime()}.json`);
+          showNotice('检查摘要已下载，包含采样时间与当前采集状态。', 'info');
+        } catch (error) { showNotice(`未能下载摘要：${readableError(error)}`); }
+      });
+
+      function resetView() {
+        Object.assign(view, {yaw: -0.75, pitch: 0.6, distance: 14});
+        clearLidar();
+        render();
+      }
+      $('lidar-reset').addEventListener('click', resetView);
+      $('lidar-color').addEventListener('change', () => {
+        const byHeight = $('lidar-color').value === 'height';
+        $('lidar-color-low').textContent = byHeight ? '−2 m 及以下' : '0 m';
+        $('lidar-color-high').textContent = byHeight ? '+2 m 及以上' : '10 m 及以上';
+        scheduleLidarDraw();
+      });
+      canvas.addEventListener('pointerdown', event => {
+        if (event.button !== 0 && event.pointerType === 'mouse') return;
+        drag = {id: event.pointerId, x: event.clientX, y: event.clientY};
+        canvas.setPointerCapture(event.pointerId);
+        canvas.focus({preventScroll: true});
+      });
+      canvas.addEventListener('pointermove', event => {
+        if (!drag || event.pointerId !== drag.id) return;
+        view.yaw += (event.clientX - drag.x) * 0.008;
+        view.pitch = Math.max(-1.4, Math.min(1.4, view.pitch + (event.clientY - drag.y) * 0.008));
+        drag.x = event.clientX; drag.y = event.clientY;
+        scheduleLidarDraw();
+      });
+      const releasePointer = event => { if (drag?.id === event.pointerId) drag = null; };
+      canvas.addEventListener('pointerup', releasePointer);
+      canvas.addEventListener('pointercancel', releasePointer);
+      canvas.addEventListener('lostpointercapture', releasePointer);
+      canvas.addEventListener('wheel', event => {
+        event.preventDefault();
+        view.distance = Math.max(1, Math.min(120, view.distance * Math.exp(event.deltaY * 0.001)));
+        scheduleLidarDraw();
+      }, {passive: false});
+      canvas.addEventListener('keydown', event => {
+        if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', '+', '=', '-', 'Home'].includes(event.key)) return;
+        event.preventDefault();
+        if (event.key === 'Home') { resetView(); return; }
+        if (event.key === 'ArrowLeft') view.yaw -= 0.1;
+        if (event.key === 'ArrowRight') view.yaw += 0.1;
+        if (event.key === 'ArrowUp') view.pitch = Math.min(1.4, view.pitch + 0.1);
+        if (event.key === 'ArrowDown') view.pitch = Math.max(-1.4, view.pitch - 0.1);
+        if (event.key === '+' || event.key === '=') view.distance = Math.max(1, view.distance / 1.15);
+        if (event.key === '-') view.distance = Math.min(120, view.distance * 1.15);
+        scheduleLidarDraw();
+      });
+      $('lidar-save').addEventListener('click', () => {
+        if (!lidarFresh()) { showNotice('当前点云已过期或采集已停止，请等待新鲜点云后保存。'); return; }
+        const frame = {...lidarFrame, age_ms: Math.round(lidarAge()), exported_at: new Date().toISOString(), note: '此文件保存网页当前显示的抽样点，非完整原始点云；不构成设备验收结论。'};
+        download(new Blob([JSON.stringify(frame) + '\n'], {type: 'application/json'}), `g1-lidar-${filenameTime()}.json`);
+        showNotice('当前显示的点云已下载，包含采样序号、坐标系与抽样点。', 'info');
+      });
+      if (typeof ResizeObserver !== 'undefined') new ResizeObserver(scheduleLidarDraw).observe(canvas);
+      else window.addEventListener('resize', scheduleLidarDraw);
+      setInterval(pollLidar, 200);
+      setInterval(render, 250);
+      poll();
+    })();
+  </script>
+</body>
+</html>

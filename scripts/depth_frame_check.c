@@ -2,6 +2,12 @@
  * Build: gcc -std=c11 -O2 -Wall -Wextra -Wpedantic depth_frame_check.c -o depth_frame_check
  * Run: timeout --kill-after=3 20 ./depth_frame_check --device /dev/video0 \
  *          --seconds 10 --output /tmp/depth-last.pgm
+ * Probe: ./depth_frame_check --probe /dev/video0
+ * Stream: ./depth_frame_check --device /dev/video0 --seconds 900 --stream
+ * Streaming stdout contains D16F records only: magic[4], little-endian u32
+ * width/height/sequence, u64 V4L2 timestamp_us, u32 payload_length, followed by
+ * tightly packed little-endian Z16 pixels. Logs go to stderr. Receivers must
+ * discard a partial final record after EOF; a pipe write is not frame-atomic.
  *
  * This opens only the explicitly named capture node and temporarily changes its
  * format. It does not change controls, frame interval, firmware, or services.
@@ -36,9 +42,13 @@
 #define WIDTH 640U
 #define HEIGHT 480U
 #define MAX_BUFFERS 8U
-#define MAX_SEQUENCES 65536U
+#define MAX_SEQUENCES 131072U
+#define SEQUENCE_SLOTS (MAX_SEQUENCES * 2U)
+#define FRAME_BYTES (WIDTH * HEIGHT * 2U)
 
 static volatile sig_atomic_t interrupted;
+static FILE *diagnostics;
+#define LOG(...) fprintf(diagnostics, __VA_ARGS__)
 
 static void on_signal(int number) { interrupted = number; }
 
@@ -57,9 +67,136 @@ static double now_seconds(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+static bool valid_device_path(const char *device) {
+    return device && !strncmp(device, "/dev/video", 10) && device[10] &&
+           strspn(device + 10, "0123456789") == strlen(device + 10);
+}
+
+static void json_string(const char *value, size_t limit) {
+    fputc('"', stdout);
+    for (size_t i = 0; i < limit && value[i]; i++) {
+        unsigned char byte = (unsigned char)value[i];
+        if (byte == '"' || byte == '\\') fprintf(stdout, "\\%c", byte);
+        else if (byte < 32 || byte >= 127) fprintf(stdout, "\\u%04x", byte);
+        else fputc(byte, stdout);
+    }
+    fputc('"', stdout);
+}
+
+/* QUERYCAP and ENUM_FMT only: no buffer allocation or format/control writes. */
+static int probe_device(const char *device) {
+    if (!valid_device_path(device)) {
+        fprintf(stderr, "Probe requires /dev/videoN\n");
+        return 2;
+    }
+    int fd = open(device, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    const char *error = "open capture node";
+    struct stat st;
+    struct v4l2_capability caps = {0};
+    uint32_t capabilities = 0;
+    bool capture = false, streaming = false, z16 = false;
+    if (fd < 0) goto failed;
+    error = "fstat capture node";
+    if (fstat(fd, &st) < 0) goto failed;
+    if (!S_ISCHR(st.st_mode)) { errno = ENODEV; goto failed; }
+    error = "VIDIOC_QUERYCAP";
+    if (xioctl(fd, VIDIOC_QUERYCAP, &caps) < 0) goto failed;
+    capabilities = caps.capabilities & V4L2_CAP_DEVICE_CAPS ?
+                   caps.device_caps : caps.capabilities;
+    capture = (capabilities & V4L2_CAP_VIDEO_CAPTURE) != 0;
+    streaming = (capabilities & V4L2_CAP_STREAMING) != 0;
+    if (capture) {
+        error = "VIDIOC_ENUM_FMT";
+        for (unsigned index = 0; index < 256; index++) {
+            struct v4l2_fmtdesc desc = {0};
+            desc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            desc.index = index;
+            if (xioctl(fd, VIDIOC_ENUM_FMT, &desc) < 0) {
+                if (errno == EINVAL) break;
+                goto failed;
+            }
+            if (desc.pixelformat == V4L2_PIX_FMT_Z16) z16 = true;
+        }
+    }
+    if (close(fd) < 0) { fd = -1; error = "close capture node"; goto failed; }
+    fputs("{\"ok\":true,\"device\":", stdout);
+    json_string(device, strlen(device));
+    fputs(",\"driver\":", stdout); json_string((const char *)caps.driver, sizeof(caps.driver));
+    fputs(",\"card\":", stdout); json_string((const char *)caps.card, sizeof(caps.card));
+    fputs(",\"bus_info\":", stdout); json_string((const char *)caps.bus_info, sizeof(caps.bus_info));
+    fprintf(stdout, ",\"capabilities\":%u,\"video_capture\":%s,\"streaming\":%s,"
+            "\"z16\":%s,\"usable_depth\":%s}\n", capabilities, capture ? "true" : "false",
+            streaming ? "true" : "false", z16 ? "true" : "false",
+            capture && streaming && z16 ? "true" : "false");
+    return 0;
+
+failed: {
+        int saved_errno = errno;
+        if (fd >= 0) close(fd);
+        fputs("{\"ok\":false,\"device\":", stdout);
+        json_string(device, strlen(device));
+        fputs(",\"error\":", stdout); json_string(error, strlen(error));
+        fprintf(stdout, ",\"errno\":%d,\"detail\":", saved_errno);
+        json_string(strerror(saved_errno), strlen(strerror(saved_errno)));
+        fputs("}\n", stdout);
+        return 1;
+    }
+}
+
+/* Encoded sequence+1 leaves zero as an empty slot, including for UINT32_MAX. */
+static int remember_sequence(uint64_t *table, uint32_t sequence, unsigned *unique) {
+    uint64_t encoded = (uint64_t)sequence + 1;
+    unsigned slot = (sequence * UINT32_C(2654435761)) & (SEQUENCE_SLOTS - 1U);
+    while (table[slot] && table[slot] != encoded)
+        slot = (slot + 1U) & (SEQUENCE_SLOTS - 1U);
+    if (table[slot]) return 0;
+    if (*unique == MAX_SEQUENCES) return -1;
+    table[slot] = encoded;
+    (*unique)++;
+    return 1;
+}
+
+static void put_le(uint8_t *destination, uint64_t value, unsigned length) {
+    for (unsigned i = 0; i < length; i++) destination[i] = (uint8_t)(value >> (i * 8));
+}
+
+/* Caller makes stdout nonblocking. One deadline covers both header and pixels. */
+static int write_until(const uint8_t *data, size_t length, double deadline) {
+    while (length) {
+        if (interrupted) { errno = EINTR; return -1; }
+        double current = now_seconds();
+        if (current < 0) return -1;
+        double remaining = deadline - current;
+        if (remaining <= 0) { errno = ETIMEDOUT; return -1; }
+        ssize_t written = write(STDOUT_FILENO, data, length);
+        if (written > 0) { data += written; length -= (size_t)written; continue; }
+        if (!written) { errno = EIO; return -1; }
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+        int timeout_ms = remaining < 0.25 ? (int)(remaining * 1000) + 1 : 250;
+        struct pollfd output = {.fd = STDOUT_FILENO, .events = POLLOUT};
+        int ready = poll(&output, 1, timeout_ms);
+        if (ready < 0) { if (errno == EINTR) continue; return -1; }
+        if (output.revents & (POLLERR | POLLHUP | POLLNVAL)) { errno = EPIPE; return -1; }
+    }
+    return 0;
+}
+
+static int stream_frame(const uint8_t *frame, uint32_t sequence, uint64_t timestamp,
+                        double deadline) {
+    uint8_t header[28] = {'D', '1', '6', 'F'};
+    put_le(header + 4, WIDTH, 4);
+    put_le(header + 8, HEIGHT, 4);
+    put_le(header + 12, sequence, 4);
+    put_le(header + 16, timestamp, 8);
+    put_le(header + 24, FRAME_BYTES, 4);
+    if (write_until(header, sizeof(header), deadline) < 0) return -1;
+    return write_until(frame, FRAME_BYTES, deadline);
+}
+
 static void print_format(const char *label, const struct v4l2_format *fmt) {
     const struct v4l2_pix_format *p = &fmt->fmt.pix;
-    printf("%s width=%u height=%u fourcc=%c%c%c%c bytesperline=%u sizeimage=%u field=%u\n",
+    LOG("%s width=%u height=%u fourcc=%c%c%c%c bytesperline=%u sizeimage=%u field=%u\n",
            label, p->width, p->height, p->pixelformat & 255,
            (p->pixelformat >> 8) & 255, (p->pixelformat >> 16) & 255,
            (p->pixelformat >> 24) & 255, p->bytesperline, p->sizeimage, p->field);
@@ -92,14 +229,16 @@ static int write_pgm(const char *path, const uint8_t *frame) {
     }
     if (fclose(file) != 0) failed = 1;
     if (failed) { fprintf(stderr, "PGM write failed\n"); unlink(path); return -1; }
-    printf("output_pgm=%s\n", path);
+    LOG("output_pgm=%s\n", path);
     return 0;
 }
 
 struct mapping { void *data; size_t length; };
 
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--probe")) return probe_device(argv[2]);
     const char *device = NULL, *output = NULL;
+    bool stream_mode = false;
     long seconds = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--device") && i + 1 < argc && !device) {
@@ -110,47 +249,58 @@ int main(int argc, char **argv) {
             char *end;
             errno = 0;
             seconds = strtol(argv[++i], &end, 10);
-            if (errno || *end || seconds < 1 || seconds > 30) seconds = -1;
+            if (errno || *end || seconds < 1 || seconds > 900) seconds = -1;
+        } else if (!strcmp(argv[i], "--stream") && !stream_mode) {
+            stream_mode = true;
         } else {
             fprintf(stderr, "Unexpected, repeated, or incomplete argument: %s\n", argv[i]);
             return 2;
         }
     }
-    if (!device || strncmp(device, "/dev/video", 10) || !device[10] ||
-        strspn(device + 10, "0123456789") != strlen(device + 10) ||
-        !output || !*output || seconds < 1 || seconds > 30) {
-        fprintf(stderr, "Usage: %s --device /dev/videoN --seconds 1..30 --output NEW.pgm\n", argv[0]);
+    if (!valid_device_path(device) || seconds < 1 || seconds > (stream_mode ? 900 : 30) ||
+        (stream_mode ? output != NULL : (!output || !*output))) {
+        fprintf(stderr, "Usage: %s --device /dev/videoN --seconds 1..30 --output NEW.pgm\n"
+                "       %s --device /dev/videoN --seconds 1..900 --stream\n"
+                "       %s --probe /dev/videoN\n", argv[0], argv[0], argv[0]);
         return 2;
     }
+    diagnostics = stream_mode ? stderr : stdout;
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     action.sa_handler = on_signal;
     sigemptyset(&action.sa_mask);
-    if (sigaction(SIGINT, &action, NULL) || sigaction(SIGTERM, &action, NULL)) {
+    if (sigaction(SIGINT, &action, NULL) || sigaction(SIGTERM, &action, NULL) ||
+        sigaction(SIGPIPE, &action, NULL) || sigaction(SIGHUP, &action, NULL)) {
         perror("sigaction"); return 1;
     }
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    int fd = -1, failed = 0;
+    setvbuf(diagnostics, NULL, _IOLBF, 0);
+    int fd = -1, failed = 0, stdout_flags = -1;
     bool format_changed = false, buffers_requested = false, streaming = false;
     struct mapping maps[MAX_BUFFERS] = {{0}};
     struct v4l2_format original = {0}, format = {0};
     uint8_t *last_frame = NULL;
-    uint32_t *sequences = NULL;
+    uint64_t *sequences = NULL;
     unsigned mapped = 0, unique = 0;
     uint64_t dequeued = 0, complete = 0, error_frames = 0, short_frames = 0;
     uint64_t all_zero = 0, duplicates = 0, missing = 0, backwards = 0;
     uint64_t repeated_times = 0, backwards_times = 0, invalid_times = 0;
     uint64_t pixels = 0, nonzero = 0, last_nonzero = 0;
+    uint64_t emitted = 0, throttled = 0, stream_rejected = 0;
     unsigned minimum = UINT16_MAX, maximum = 0, last_minimum = 0, last_maximum = 0;
     uint32_t previous_seq = 0, first_seq = 0, last_seq = 0;
     int64_t first_time = 0, previous_time = 0, last_time = 0;
     uint32_t timestamp_flags = 0;
-    double started = 0, elapsed = 0;
+    double started = 0, elapsed = 0, next_emit = 0;
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
 #define FAIL(message) do { perror(message); failed = 1; goto cleanup; } while (0)
 #define REJECT(message) do { fprintf(stderr, "%s\n", message); failed = 1; goto cleanup; } while (0)
 
+    if (stream_mode) {
+        stdout_flags = fcntl(STDOUT_FILENO, F_GETFL);
+        if (stdout_flags < 0 || fcntl(STDOUT_FILENO, F_SETFL, stdout_flags | O_NONBLOCK) < 0)
+            FAIL("set binary stdout nonblocking");
+    }
     fd = open(device, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) FAIL("open capture node");
     struct stat st;
@@ -160,7 +310,7 @@ int main(int argc, char **argv) {
     if (xioctl(fd, VIDIOC_QUERYCAP, &caps) < 0) FAIL("VIDIOC_QUERYCAP");
     uint32_t capabilities = caps.capabilities & V4L2_CAP_DEVICE_CAPS ?
                             caps.device_caps : caps.capabilities;
-    printf("device=%s driver=%.16s card=%.32s bus=%.32s capabilities=0x%08x\n",
+    LOG("device=%s driver=%.16s card=%.32s bus=%.32s capabilities=0x%08x\n",
            device, caps.driver, caps.card, caps.bus_info, capabilities);
     if (!(capabilities & V4L2_CAP_VIDEO_CAPTURE) || !(capabilities & V4L2_CAP_STREAMING))
         REJECT("Requires single-plane VIDEO_CAPTURE and STREAMING capabilities");
@@ -200,8 +350,8 @@ int main(int argc, char **argv) {
     size_t required = (size_t)(HEIGHT - 1) * format.fmt.pix.bytesperline + WIDTH * 2;
     if (format.fmt.pix.sizeimage < required)
         REJECT("Driver sizeimage is too small for the configured Z16 frame");
-    last_frame = malloc((size_t)WIDTH * HEIGHT * 2);
-    sequences = malloc((size_t)MAX_SEQUENCES * sizeof(*sequences));
+    last_frame = malloc(FRAME_BYTES);
+    sequences = calloc(SEQUENCE_SLOTS, sizeof(*sequences));
     if (!last_frame || !sequences) FAIL("malloc capture storage");
     struct v4l2_requestbuffers request = {0};
     request.count = 4;
@@ -255,18 +405,17 @@ int main(int argc, char **argv) {
         if (buffer.index >= mapped) REJECT("Driver returned an invalid buffer index");
         if (buffer.bytesused > maps[buffer.index].length)
             REJECT("Driver bytesused exceeds mapped buffer length");
-        bool seen = false;
-        for (unsigned i = 0; i < unique; i++) {
-            if (sequences[i] == buffer.sequence) { seen = true; break; }
-        }
-        if (seen) duplicates++;
-        else {
-            if (unique == MAX_SEQUENCES) REJECT("Sequence tracking limit exceeded");
-            sequences[unique++] = buffer.sequence;
-        }
-        int64_t stamp = (int64_t)buffer.timestamp.tv_sec * 1000000 + buffer.timestamp.tv_usec;
-        if (buffer.timestamp.tv_sec < 0 || buffer.timestamp.tv_usec < 0 ||
-            buffer.timestamp.tv_usec >= 1000000 || stamp <= 0) invalid_times++;
+        int remembered = remember_sequence(sequences, buffer.sequence, &unique);
+        if (remembered < 0) REJECT("Sequence tracking limit exceeded");
+        if (!remembered) duplicates++;
+        bool timestamp_valid = buffer.timestamp.tv_sec >= 0 &&
+                               (uint64_t)buffer.timestamp.tv_sec <= (uint64_t)INT64_MAX / 1000000 - 1 &&
+                               buffer.timestamp.tv_usec >= 0 && buffer.timestamp.tv_usec < 1000000;
+        int64_t stamp = timestamp_valid ?
+            (int64_t)buffer.timestamp.tv_sec * 1000000 + buffer.timestamp.tv_usec : 0;
+        timestamp_valid = timestamp_valid && stamp > 0;
+        if (!timestamp_valid) invalid_times++;
+        bool metadata_ok = timestamp_valid && remembered != 0;
         if (dequeued == 1) {
             first_seq = buffer.sequence;
             first_time = stamp;
@@ -277,12 +426,15 @@ int main(int argc, char **argv) {
             else if (delta >= UINT32_C(0x80000000)) backwards++;
             if (stamp == previous_time) repeated_times++;
             else if (stamp < previous_time) backwards_times++;
+            metadata_ok = metadata_ok && delta > 0 && delta < UINT32_C(0x80000000) &&
+                          stamp > previous_time;
         }
         previous_seq = last_seq = buffer.sequence;
         previous_time = last_time = stamp;
         if (buffer.flags & V4L2_BUF_FLAG_ERROR) error_frames++;
         if (buffer.bytesused < required) short_frames++;
-        if (!(buffer.flags & V4L2_BUF_FLAG_ERROR) && buffer.bytesused >= required) {
+        bool full_frame = !(buffer.flags & V4L2_BUF_FLAG_ERROR) && buffer.bytesused >= required;
+        if (full_frame) {
             uint64_t count = 0;
             unsigned low = UINT16_MAX, high = 0;
             for (unsigned y = 0; y < HEIGHT; y++) {
@@ -308,6 +460,20 @@ int main(int argc, char **argv) {
             last_maximum = high;
         }
         if (xioctl(fd, VIDIOC_QBUF, &buffer) < 0) FAIL("VIDIOC_QBUF recycle");
+        /* The driver owns the mmap buffer again; emit from our packed copy. */
+        if (stream_mode) {
+            if (!full_frame || !metadata_ok || !last_nonzero) { stream_rejected++; continue; }
+            double send_started = now_seconds();
+            if (send_started < 0) REJECT("Cannot read stream output clock");
+            if (send_started < next_emit) { throttled++; continue; }
+            if (send_started >= started + seconds) break;
+            double send_deadline = send_started + 2.0;
+            if (send_deadline > started + seconds) send_deadline = started + seconds;
+            if (stream_frame(last_frame, last_seq, (uint64_t)stamp, send_deadline) < 0)
+                FAIL("write bounded D16F frame");
+            emitted++;
+            next_emit = send_started + 0.1;
+        }
     }
 
 cleanup:
@@ -318,7 +484,7 @@ cleanup:
     }
     if (streaming) {
         if (xioctl(fd, VIDIOC_STREAMOFF, &type) < 0) { perror("VIDIOC_STREAMOFF"); failed = 1; }
-        else printf("streamoff=ok\n");
+        else LOG("streamoff=ok\n");
     }
     for (unsigned i = 0; i < mapped; i++) {
         if (munmap(maps[i].data, maps[i].length) < 0) { perror("munmap"); failed = 1; }
@@ -336,34 +502,42 @@ cleanup:
             perror("restore original format"); failed = 1;
         } else if (!same_format(&restored, &original)) {
             fprintf(stderr, "Original format did not restore exactly\n"); failed = 1;
-        } else printf("format_restore=ok\n");
+        } else LOG("format_restore=ok\n");
     }
     if (fd >= 0 && close(fd) < 0) { perror("close capture node"); failed = 1; }
-    if (complete && write_pgm(output, last_frame) < 0) failed = 1;
+    if (!stream_mode && complete && write_pgm(output, last_frame) < 0) failed = 1;
+    if (stdout_flags >= 0 && fcntl(STDOUT_FILENO, F_SETFL, stdout_flags) < 0) {
+        perror("restore stdout flags"); failed = 1;
+    }
+    if (stream_mode && !emitted) failed = 1;
     if (interrupted || complete < 2 || !nonzero || all_zero || error_frames || short_frames ||
         duplicates || missing || backwards || repeated_times || backwards_times || invalid_times)
         failed = 1;
-    printf("summary elapsed_seconds=%.6f requested_seconds=%ld dequeued=%" PRIu64
+    LOG("summary elapsed_seconds=%.6f requested_seconds=%ld dequeued=%" PRIu64
            " complete_frames=%" PRIu64 " observed_fps=%.3f unique_sequences=%u"
            " duplicate_sequences=%" PRIu64 " missing_sequences=%" PRIu64
            " backwards_sequences=%" PRIu64 " error_flag_frames=%" PRIu64
            " short_frames=%" PRIu64 " all_zero_frames=%" PRIu64 "\n",
            elapsed, seconds, dequeued, complete, elapsed > 0 ? complete / elapsed : 0,
            unique, duplicates, missing, backwards, error_frames, short_frames, all_zero);
-    printf("timestamps first_sequence=%u last_sequence=%u first_us=%" PRId64
+    LOG("timestamps first_sequence=%u last_sequence=%u first_us=%" PRId64
            " last_us=%" PRId64 " first_flags=0x%08x repeated=%" PRIu64
            " backwards=%" PRIu64 " invalid=%" PRIu64 "\n",
            first_seq, last_seq, first_time, last_time, timestamp_flags,
            repeated_times, backwards_times, invalid_times);
-    printf("depth raw_units=true total_pixels=%" PRIu64 " nonzero_pixels=%" PRIu64
+    LOG("depth raw_units=true total_pixels=%" PRIu64 " nonzero_pixels=%" PRIu64
            " nonzero_fraction=%.6f nonzero_min=%u max=%u last_nonzero_fraction=%.6f"
            " last_nonzero_min=%u last_max=%u\n",
            pixels, nonzero, pixels ? (double)nonzero / pixels : 0,
            nonzero ? minimum : 0, maximum, (double)last_nonzero / ((uint64_t)WIDTH * HEIGHT),
            last_minimum, last_maximum);
-    printf("result=%s interrupted_signal=%d scope=bounded_raw_depth_stream_only\n",
+    LOG("result=%s interrupted_signal=%d scope=bounded_raw_depth_stream_only\n",
            failed ? "incomplete_or_anomalous" : "frames_received_without_observed_stream_errors",
            (int)interrupted);
+    if (stream_mode)
+        LOG("stream emitted_frames=%" PRIu64 " throttled_frames=%" PRIu64
+            " rejected_frames=%" PRIu64 " max_output_fps=10 frame_header_bytes=28\n",
+            emitted, throttled, stream_rejected);
     free(last_frame);
     free(sequences);
     return interrupted ? 128 + interrupted : failed;
