@@ -2,6 +2,15 @@
 __pycache__/
 *.pyc
 evidence/
-output/pdf/
+output/
 .sensor-web/
 Unitree_G1_EDU_U2_二手采购完整验收表.xlsx
+
+# Local captures, reports, credentials and development environments
+*.pdf
+*.xlsx
+.env
+.env.*
+!.env.example
+.venv/
+logs/

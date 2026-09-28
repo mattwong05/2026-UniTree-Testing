@@ -1,110 +1,90 @@
-# G1 二手设备现场测试
+# Unitree G1 设备测试工具
 
-本目录保存 2026-09-20 的连接、计算功能和关节遥测测试工具。原始验收表保留不变，原始证据保存在 `evidence/2026-09-20/`，测试结论见 `reports/2026-09-20.md`。
+用于 **2026-09-20 现场测试的特定 Unitree G1 29 轴设备**，覆盖硬件参数读取、传感器状态检查、电机受控测试、普通/深度摄像头采集及雷达数据读取。
 
-新增[LiDAR 与相机网络实测](reports/sensors-2026-09-20.md)：头部 USB-Type-C 接好后，D435i 连续返回 1080p 彩色图和 640×480 深度帧；MID360 连续点云约 9.97 Hz，但有光学窗口脏污警告，需清洁检查后复测。测试结果与样图仍经网线/SSH取回。雷达驱动的服务启停状态已恢复；详细统计、参数变化和复现方式见专项报告。
+这是现场测试程序的整理归档，不是通用 G1 SDK，也不是完整的机器人控制系统。代码依赖当时设备的 SDK、固件、网络与厂家服务配置；其他设备需要逐项核对适配。历史报告中的 `G1-01`、`G1-02` 是测试记录名称，不是整机序列号。
 
-需要在浏览器实时看彩色视频、深度图和雷达点云，可运行 `python3 scripts/start_sensor_web.py --host 192.168.123.164 --name g1-01`，打开本地网页后点击「连接预览」。支持停止重连、快照、点云和检查摘要下载；换另一台可改用 `--name g1-02`。连接方法、换机步骤和显示限制见[实时传感器网页说明](docs/sensor-web.md)。
+**开始使用： [简明使用指南](docs/usage.md)** · [传感器网页](docs/sensor-web.md) · [电机测试指南](docs/g1-cli-reuse.md)
 
-当前已经验证网络连接、Jetson 计算功能和 29 轴遥测。早期上身接管测试触发保护，未完成目标轨迹。后续[吊装底层检查](reports/lowlevel-joints-2026-09-20.md)验证了左肘独立使能与退出禁用反馈；两次 1° 跟随未满足本次判定，单轴 15° 尝试在约 5.44° 时因未使能左肩随动越限中止。后续四轴肩部保持方案完整执行约 50 秒，左肘反馈增量约 13.65°，回位偏差约 0.96° 仍超线；其他五轴仅完成只读预检。**目前不能将主动控制或整机电机能力判定为验收通过。**
+## 功能板块
 
-计算单元专项报告见 [100 TOPS 规格核验与 INT8 短测](reports/compute-capacity-2026-09-20.md)，现场 PDF 保存在 `output/pdf/G1_U2_计算单元能力报告_2026-09-20.pdf`。设备配置与原始 Orin NX 16 GB 标称 100 TOPS 相符；本次 GPU、双 DLA 的 INT8 短测及 GPU 稀疏测试通过有限自检，**未验证持续 100 TOPS**。
+| 板块 | 能做什么 | 入口 |
+| --- | --- | --- |
+| 硬件参数 | 读取 CPU、内存、存储、USB、网卡、温度、功率模式与 CUDA/TensorRT 信息 | `scripts/read_compute_inventory.py` |
+| 传感器与关节状态 | 订阅 LowState，记录关节角度、速度、估算力矩、温度、电压、错误码及原始状态快照 | `scripts/read_lowstate.py` |
+| 电机测试 | 默认只读预检；显式执行原位保持、小角度往返与受保护的逐轴测试 | `scripts/lowlevel_joint_check.py`、`scripts/upper_body_check.py` |
+| 普通摄像头 | 读取厂家视频 RPC，实时显示彩色图像或保存短时采样 | `scripts/camera_sample_check.py` |
+| 深度摄像头 | 读取 D435i Z16 深度帧，显示伪彩图；独立工具可保存原始深度 PGM | `scripts/depth_frame_check.c` |
+| 雷达 | 订阅 MID360 点云，读取设备信息和诊断告警，提供三维预览及采样导出 | `scripts/lidar_cloud_check.py`、`scripts/livox_readonly_probe.py` |
+| 计算检查 | CPU/GPU/DLA 功能自检与有时限、温度检查的 INT8 吞吐短测 | `scripts/compute_smoke.py`、`scripts/compute_int8_bench.py` |
 
-后续吊装/调试模式的[复测对比](reports/compute-retest-debug-2026-09-20.md)显示，同参数吞吐变化约 -0.15% 至 -1.43%，没有明显提升；GPU 放大输入后的补测约 13.19–13.23 TOPS。头部 RJ45 已连接到正确的 .164 Orin 开发计算单元，本地 CUDA 计时不包含网络输入传输，不能把各次跑分相加后除以 100 解读为剩余算力。复测 PDF 位于 `output/pdf/G1_U2_计算单元复测对比报告_2026-09-20.pdf`。
+网页集中展示 **RGB、深度、雷达点云**，支持连接/停止、重新连接、快照与检查摘要下载。硬件清单、关节遥测和电机测试通过命令行运行。
 
-换机后的 G1-02 单独归档为[硬件配置报告](reports/g1-02-hardware-2026-09-20.md)和[算力测试报告](reports/g1-02-compute-2026-09-20.md)，原始记录位于 `evidence/2026-09-20/new-device-1908/`。G1-02 是本次记录编号，不是整机序列号。两台 IP、SSH 主机密钥和系统标识相同，但网卡 MAC、相机及雷达序列号不同；换机应重新核对硬件，不能复用上一台的健康结论。
+## 适用环境
 
-G1-02 的 11 次计算短测均通过有限自检：GPU 密集 32×32 / 64×64 分别为 10.717 / 13.222 TOPS，DLA0 / DLA1 为 4.724 / 4.854 TOPS。稀疏首轮 8.064、同参数重新构建后 11.163 TOPS，保留了实际内核选择差异；最高温度 61.093°C。MID360 有窗口脏污告警，未认证持续 100 TOPS。两份 PDF 分别位于 `output/pdf/G1-02_硬件配置核验报告_2026-09-20.pdf` 和 `output/pdf/G1-02_算力测试报告_2026-09-20.pdf`。
+| 位置 | 已使用的环境 |
+| --- | --- |
+| 操作电脑 | macOS / Apple Silicon，Python 3、SSH、SCP、浏览器 |
+| 机器人 | G1 29 轴，Jetson Orin NX 16 GB，Linux，Python 3.8+ |
+| 机载依赖 | 已有 `unitree_sdk2py`、Cyclone DDS、NumPy、OpenCV；深度采集需 GCC 与 Linux V4L2 头文件 |
+| 计算测试 | 当时机载 TensorRT 8.5、CUDA 11.4 环境 |
+| 传感器 | Intel RealSense D435i、Livox MID360 |
+
+程序复用机载环境，不自动安装机器人依赖、升级固件或修改校准。网页无 npm 构建流程、外部 CDN 或云服务依赖。操作电脑不需要安装机器人 SDK。
 
 ## 环境和连接
 
-现场 Mac 为 Apple Silicon/macOS，USB 网卡为 AX88179B/en10。机器人计算模块为 `192.168.123.164`，用户 `unitree`。密码不放入脚本、文档或 Git。
+当时开发计算单元地址为 `192.168.123.164`，SSH 用户为 `unitree`，机载 DDS 网卡为 `eth0`。这些是现场配置示例，使用前应核对实物、网口与地址。密码由 SSH 交互输入，不写入脚本。
 
-仅当确认本次接口与网段仍一致时，可添加临时地址：
-
-```sh
-sudo ifconfig en10 inet 192.168.123.100 netmask 255.255.255.0 alias
-ssh unitree@192.168.123.164
-```
-
-移除本次临时地址：
+确认电脑已接入机器人网络且可以 SSH 登录后，在仓库根目录运行：
 
 ```sh
-sudo ifconfig en10 inet 192.168.123.100 -alias
+python3 scripts/start_sensor_web.py --host 192.168.123.164 --name g1-02
 ```
 
-此操作不修改网络服务的持久 DHCP 配置、Wi-Fi 或默认网关。测试结束时保留临时地址供现场继续连接。
+启动器检查机载依赖、将采集程序上传到临时目录并建立 SSH 转发。浏览器打开 <http://127.0.0.1:8765> 后，点击 **连接预览**。相机 USB 数据线也必须连接；只有网线不能代替相机 USB 连接。
 
-## 运行方式
+预览可能临时开启原本停止的头部视频服务和雷达驱动；点击 **停止** 后应等待服务恢复确认，再在终端按 `Ctrl+C` 退出。网络中断时不能假定恢复已完成。具体连接、网络配置与排错见[使用指南](docs/usage.md)。
 
-脚本使用机器人已有 Python 3.8、Unitree SDK、Cyclone DDS、NumPy、TensorRT 8.5 和 CUDA 11.4。不在机器人安装依赖、不升级固件、不改变功率模式。脚本可经 SSH 标准输入运行，也可复制到机上临时目录执行。
+## 电机控制与结果边界
 
-换机先采集只读配置（默认仅枚举 CUDA，不运行计算负载）：
+电机脚本默认只读；`--execute` 才发送动作命令，`--release-motion` 是独立的控制权释放操作。底层测试要求现场吊装、调试模式、身份核对、活动空间及独立停止手段，并检查控制权与关节禁用状态。运行前阅读[底层逐轴说明](docs/ssh-lowlevel-joints.md)。
 
-```sh
-ssh unitree@192.168.123.164 'timeout 90 python3 -' \
-  < scripts/read_compute_inventory.py > inventory.json
+历史实测完成了部分使能、运动反馈与退出禁用检查，但出现过保护中止和回位偏差超限；上肢 `rt/arm_sdk` 接管仍有未解决现象。**不能将这些程序描述为已通过完整电机验收或适用于任意 G1 的控制器。** 不要为完成动作而放宽保护阈值。
+
+摄像头有画面、雷达有点云只证明当次采集链路可用，不代表标定、精度或长期可靠性合格。深度伪彩图不是已校准距离；GPU/DLA 短测不是持续 100 TOPS 认证。历史 MID360 窗口脏污告警仍需现场处理。
+
+## 目录与文档
+
+```text
+scripts/    硬件清单、遥测、计算、电机和传感器测试入口
+web/        本地传感器网页、机载 HTTP 服务和数据解析
+tests/     离线单元测试（不连接机器人）
+docs/       使用指南与专项操作说明
+reports/    2026-09-20 历史测试记录与结论
 ```
 
-输出包含设备树、CPU/RAM、NVMe 型号与序列号、USB/视频设备、网卡地址、温度、功率模式及 CUDA/TensorRT 信息。缺少工具、权限不足或命令超时会保留为证据缺口，不自动判断硬件故障；不安装工具、不调用 sudo、不采集凭据。可选 `--cuda-memory-info` 查询空闲显存，会初始化 CUDA context；该查询不等于内存健康检测。硬件枚举与相机画面、雷达点云、SSD 寿命和整机验收需要分别验证。
+- [简明使用指南](docs/usage.md)：连接、分模块运行、停止与排错。
+- [实时传感器网页](docs/sensor-web.md)：画面、点云、导出与服务恢复。
+- [电机命令行指南](docs/g1-cli-reuse.md)：身份核对、逐轴预检与执行。
+- [底层逐轴说明](docs/ssh-lowlevel-joints.md) / [上肢控制说明](docs/ssh-upper-body.md)：两种控制接口的前提、保护及已知限制。
+- [历史报告索引](reports/README.md)：硬件、算力、传感器与电机实测记录。
 
-只读关节记录，包含全采样统计和约 1 Hz 快照：
+原始证据、图片/点云、PDF、采购验收表及本地 SSH 记录留在本地，不随仓库发布。历史报告引用的 `evidence/`、`output/` 是本地归档路径，公开仓库不包含这些文件。
 
-```sh
-ssh unitree@192.168.123.164 'timeout 40 python3 - --seconds 30' \
-  < scripts/read_lowstate.py > lowstate.jsonl
-```
+## 本地验证
 
-计算功能检查会产生短时负载，应在机器人静止、散热正常时运行：
-
-```sh
-ssh unitree@192.168.123.164 'timeout 140 python3 - --seconds 10' \
-  < scripts/compute_smoke.py > compute.jsonl
-```
-
-CPU 检查是 8 个进程各校验 8 MiB 缓冲区；GPU/DLA 是固定小型 FP16 卷积与 NumPy 结果比较。它们不构成全内存检测、100 TOPS 测量或持续热稳定验收。计算脚本在读不到温度或温度达到保守的 75°C 测试阈值时退出。
-
-INT8 吞吐短测使用已有 TensorRT，依次运行 GPU、DLA0、DLA1，每项约 10 秒（引擎构建另计）：
-
-```sh
-ssh unitree@192.168.123.164 'timeout --kill-after=5 690 python3 - --seconds 10' \
-  < scripts/compute_int8_bench.py > int8-dense.jsonl 2> int8-dense.stderr
-
-ssh unitree@192.168.123.164 'timeout --kill-after=5 230 python3 - --target gpu --sparse --seconds 10' \
-  < scripts/compute_int8_bench.py > int8-sparse.jsonl 2> int8-sparse.stderr
-```
-
-保持机器人静止且散热正常，避免并发运动测试。`--target gpu|dla0|dla1` 可单独选目标，`--seconds` 限 1–30；`--sparse` 仅支持 GPU。程序每 0.5 秒检查可读温度，无有效读数或最高读数达到 75°C 时退出，个别不可读传感器会跳过；另有构建/运行时限和外部 timeout。Python 监控线程不是独立硬件保护。
-
-JSONL 保存完整引擎信息、逐窗口计时和汇总，stderr 保存 TensorRT 提示。指标是 8 层固定 1×1 卷积的 dense-equivalent TOPS，一次乘加算 2 次运算，不额外对稀疏结果乘二。主指标排除构建、预热、传输及窗口间日志开销。正确性只覆盖常量输入特例；DLA 禁止 GPU fallback，但边界重排可用 GPU。各目标依次运行，不能将结果相加充当并发性能，也不能据此签署 100 TOPS 达标。详情、实际结果及官方来源见专项报告。
-
-需要检查吞吐对网络形状的敏感性时，可单独使用 `--target gpu --spatial 64 --seconds 5`。`--spatial` 仅接受 32 或 64，默认 32；64 仅允许 GPU，计数和缓冲区随尺寸同步变为 4 倍。此参数改变测试负载，结果应单列，不能作为同参数模式对比或峰值认证。
-
-手臂脚本默认只做预检，不创建命令发布器：
-
-```sh
-ssh unitree@192.168.123.164 'timeout 12 python3 - --check-all' \
-  < scripts/upper_body_check.py > arm-preflight.jsonl
-```
-
-原 `right_elbow_check.py` 已扩展并更名为 `upper_body_check.py`，可选择左右肩、肘、腕共 14 轴。默认相对偏移 +2°，允许正负 0.1–5°；`--check-all` 仅预检，不能与 `--execute` 合用。完整的 SSH 命令、关节名称和控制原理见 [SSH 上肢控制说明](docs/ssh-upper-body.md)。2026-09-20 的追加实机检查中，14 轴只读预检全部通过；未追加动作测试。
-
-`--execute` 是主动控制入口，当前有未解决的实机接管现象，不能当作已通过验证的控制程序使用。脚本只发布 `rt/arm_sdk`，保持接管前的固定实测参考，使所选关节做一次小角度往返；不发布全身 `rt/lowcmd`，不切换运动模式。目标角度可按单关节指定，但接管权重作用于上身，其他关节仍参与保持，不能理解成只给一个电机上电。
-
-用户追加的左右方向测试均在约 0.145 秒因左肩速度中止，尚未开始手腕轨迹。已修正原先随测量漂移的目标和接近零的刚度/阻尼，保留 0.6 rad/s 速度保护；新增 `--hold-only --execute`，仅做 9 秒零目标位移接管/释放检查。零目标位移仍会接管上身，不保证实际不动。此修正已通过软件模拟，尚未主动实机验证，不能视为接管问题已解决。详见 SSH 说明中的追加诊断。
-
-该脚本绑定本机已观测的 `FSM 802 / mode_machine 5 / mode_pr 0` 与现有 `127.0.0.1:8080/status` 姿态服务。它不是通用 G1 控制器。原有姿态服务必须持续为 IDLE。低状态 CRC 错误、数据超过 100 ms、遥控按键、错误码、关节模式变化、温度达到 60°C、过大偏差/速度/估算力矩或下肢明显移动都会中止。阈值是本次短测的保守限制，不是厂家额定值。
-
-退出时发送多条权重 0 释放消息并关闭本程序发布器。发布成功不等于机器人完成释放；必须用遥测与现场观察核实。硬件遥控停止仍是现场停止手段。
-
-## 验证
-
-吊装调试模式另有独立工具 `scripts/lowlevel_joint_check.py`，支持左右肩三轴、肘、髋三轴和膝共 16 个主要关节，默认每次只使能目标轴。肘部可用 `--hold-shoulder` 保持同侧三肩轴，属于四轴方案；旧的 `--hold-left-shoulder` 写法继续兼容左肘。`--delta-deg` 控制相对角度及方向，`--speed-deg-s` 设置 0.25–5°/秒的目标速度上限；肘部最大 60°、其他轴仍限 2°。执行/释放必须带经核对的 `--expect-device-id`，默认仍只读。完整命令及换机步骤见 [命令行复用指南](docs/g1-cli-reuse.md)，保护机制见 [底层逐轴说明](docs/ssh-lowlevel-joints.md)。
-
-反向 60° / 5°/秒实测在约 -6.12° 时因反馈瞬时速度约 18.2°/秒触发保护，未完成 60°，用户该轮未观察到动作；退出禁用及独立复核正常。目标速度不等于实物速度保证，该参数不是已验证的稳定工作点。新增关节名称及右侧保持通过软件测试，未在其他关节或另一台机器人上主动验证。
+沿用标准库 `unittest`，无需连接设备：
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
 
-轨迹测试在本地运行且不需要 SDK，不连接机器人。设备端另做过只读采样、计算正确性检查、手臂预检和保护中止验证；详见现场报告。项目没有既有版本体系，本次不新增版本号，不发布或推送远端。
+缺少 NumPy/OpenCV 时，相关解析与颜色测试会跳过。要覆盖这些测试，可使用 uv 的隔离临时环境，不改动系统 Python：
+
+```sh
+uv run --no-project --with numpy --with opencv-python-headless \
+  python -m unittest discover -s tests -v
+```
+
+深度 C 程序使用 Linux V4L2，需在目标 Linux 环境编译；macOS 离线测试不能替代机载编译或实机验证。本项目没有独立版本号体系，此次整理不新增版本号。

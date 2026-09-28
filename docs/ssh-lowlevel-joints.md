@@ -48,6 +48,7 @@
 文件放在机器人 `/tmp/g1-acceptance-01a0bdf8/lowlevel_joint_check.py`。临时目录可能在重启后消失；可从 Mac 的项目目录复制：
 
 ```sh
+ssh unitree@192.168.123.164 'umask 077; mkdir -p /tmp/g1-acceptance-01a0bdf8'
 scp scripts/lowlevel_joint_check.py unitree@192.168.123.164:/tmp/g1-acceptance-01a0bdf8/
 ssh unitree@192.168.123.164
 cd /tmp/g1-acceptance-01a0bdf8
